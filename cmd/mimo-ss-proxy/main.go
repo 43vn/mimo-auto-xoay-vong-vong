@@ -31,7 +31,7 @@ var (
 )
 
 func main() {
-	mode := flag.String("mode", "direct", "Proxy mode: direct, auto, custom, fallback, fallback-proxy")
+	mode := flag.String("mode", "auto", "Proxy mode: direct, auto, custom, fallback, fallback-proxy")
 	proxyURL := flag.String("proxy", "", "SS server URL for custom/fallback-proxy mode (ss://method:password@host:port)")
 	port := flag.Int("port", 18084, "HTTP listen port")
 	proxyTimeout := flag.Int("proxy-timeout", 0, "Upstream proxy timeout in seconds (0 = default 60s)")
@@ -56,6 +56,9 @@ func main() {
 	}
 
 	pool := sspool.NewSSPool()
+	var smartRouter *proxy.SmartRouter
+	var smartProxyInfos []*proxy.ProxyInfo
+	var fallbackHandler *proxy.FallbackHandler
 
 	// Load upstreams based on mode
 	switch *mode {
@@ -69,16 +72,21 @@ func main() {
 			}
 			log.Printf("[Pool] loaded %d upstreams", pool.Len())
 		}
-	case "custom":
-		if *proxyURL != "" {
-			cfg, err := sspool.ParseSSServer(*proxyURL)
-			if err != nil {
-				log.Fatalf("invalid --proxy URL: %v", err)
+
+		// For fallback-proxy: also load user-provided proxies and build SmartRouter
+		if *mode == "fallback-proxy" && (*proxyURL != "" || *proxyFile != "") {
+			smartProxyInfos = loadMixedProxies(*proxyURL, *proxyFile, pool)
+			if len(smartProxyInfos) > 0 {
+				smartRouter = proxy.NewSmartRouter(smartProxyInfos)
+				log.Printf("[SmartRouter] loaded %d mixed-protocol proxies", len(smartProxyInfos))
 			}
-			pool.Add(cfg)
 		}
-		if *proxyFile != "" {
-			loadFromFile(pool, *proxyFile)
+
+	case "custom":
+		smartProxyInfos = loadMixedProxies(*proxyURL, *proxyFile, pool)
+		if len(smartProxyInfos) > 0 {
+			smartRouter = proxy.NewSmartRouter(smartProxyInfos)
+			log.Printf("[SmartRouter] loaded %d mixed-protocol proxies", len(smartProxyInfos))
 		}
 	}
 
@@ -98,9 +106,17 @@ func main() {
 	// JWT manager
 	jwtMgr := proxy.NewJWTManager(proxy.BootstrapURL, generateFingerprint())
 
+	// Build FallbackHandler for fallback-proxy mode
+	if *mode == "fallback-proxy" {
+		fallbackHandler = proxy.NewFallbackHandler(smartRouter, 300*time.Second)
+		log.Printf("[FallbackHandler] created for fallback-proxy mode")
+	}
+
 	// Build server options
 	opts := &proxy.Options{
 		DisableRateLimit: *disableRateLimit,
+		SmartRouter:      smartRouter,
+		FallbackHandler:  fallbackHandler,
 	}
 	// mode=auto: disable local rate limiter entirely (rely on upstream 429 + rotation)
 	// other modes: disable 2s min-interval only
@@ -314,6 +330,112 @@ func savePoolToFile(pool *sspool.SSPool, filePath string) {
 		}
 	}
 	log.Printf("[File] saved %d upstreams to %s", pool.Len(), filePath)
+}
+
+// loadMixedProxies parses --proxy and --proxy-file with mixed URI support (ss://, socks5://, http://, https://).
+// It returns ProxyInfo entries for SmartRouter and adds SS-only entries to the pool.
+func loadMixedProxies(proxyURL, proxyFile string, pool *sspool.SSPool) []*proxy.ProxyInfo {
+	var infos []*proxy.ProxyInfo
+
+	// Parse single --proxy URL
+	if proxyURL != "" {
+		addMixedProxy(proxyURL, pool, &infos)
+	}
+
+	// Parse --proxy-file (one URI per line)
+	if proxyFile != "" {
+		f, err := os.Open(proxyFile)
+		if err != nil {
+			log.Printf("[File] error opening %s: %v", proxyFile, err)
+			return infos
+		}
+		defer f.Close()
+
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			addMixedProxy(line, pool, &infos)
+		}
+	}
+
+	return infos
+}
+
+// addMixedProxy parses a single URI and creates a ProxyInfo + dialer.
+// SS URIs are also added to the pool.
+func addMixedProxy(uri string, pool *sspool.SSPool, infos *[]*proxy.ProxyInfo) {
+	cfg, err := sspool.ParseProxyURI(uri)
+	if err != nil {
+		log.Printf("[Proxy] skip invalid URI %q: %v", uri, err)
+		return
+	}
+
+	var dialer sspool.ProxyDialer
+
+	switch cfg.Type {
+	case "ss":
+		// Create SS dialer
+		ssCfg := sspool.SSConfig{
+			Server:   cfg.Server,
+			Port:     cfg.Port,
+			Password: cfg.Password,
+			Method:   cfg.Method,
+		}
+		d, err := sspool.NewSSDialer(ssCfg)
+		if err != nil {
+			log.Printf("[Proxy] skip SS %s: %v", cfg.Addr(), err)
+			return
+		}
+		dialer = d
+		pool.Add(ssCfg)
+
+	case "socks5":
+		// Create SOCKS5 dialer
+		socksCfg := sspool.SOCKS5Config{
+			Server:   cfg.Server,
+			Port:     cfg.Port,
+			Username: cfg.Username,
+			Password: cfg.Password,
+		}
+		d, err := sspool.NewSOCKSDialer(socksCfg)
+		if err != nil {
+			log.Printf("[Proxy] skip SOCKS5 %s: %v", cfg.Addr(), err)
+			return
+		}
+		dialer = d
+
+	case "http", "https":
+		// Create HTTP dialer
+		httpCfg := sspool.HTTPConfig{
+			Server:   cfg.Server,
+			Port:     cfg.Port,
+			Username: cfg.Username,
+			Password: cfg.Password,
+			Scheme:   cfg.Type,
+		}
+		d, err := sspool.NewHTTPDialer(httpCfg)
+		if err != nil {
+			log.Printf("[Proxy] skip HTTP %s: %v", cfg.Addr(), err)
+			return
+		}
+		dialer = d
+
+	default:
+		log.Printf("[Proxy] skip unsupported type %q: %s", cfg.Type, uri)
+		return
+	}
+
+	pi := &proxy.ProxyInfo{
+		Address:  cfg.Addr(),
+		Protocol: cfg.Type,
+		Dialer:   dialer,
+		Alive:    true,
+	}
+	*infos = append(*infos, pi)
+	log.Printf("[Proxy] loaded %s://%s", cfg.Type, cfg.Addr())
 }
 
 // generateFingerprint creates a fingerprint string.

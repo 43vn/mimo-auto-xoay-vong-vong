@@ -18,10 +18,17 @@ var contentPattern = regexp.MustCompile(`"content"\s*:\s*"((?:[^"\\]|\\.)*)"`)
 // If no content appears within thinkingTimeout, the stream is aborted with [DONE].
 // ALWAYS sends [DONE] on ANY stream end (EOF, error, timeout) so the client
 // never hangs waiting for more data.
-func streamSSE(resp *http.Response, w http.ResponseWriter, thinkingTimeout time.Duration) error {
+// proxyInfo is optional — if non-empty, it is logged with SSE events for debugging.
+func streamSSE(resp *http.Response, w http.ResponseWriter, thinkingTimeout time.Duration, proxyInfo string) error {
 	thinkingStart := time.Now()
 	hasContent := false
 	totalLines := 0
+
+	if proxyInfo != "" {
+		log.Printf("[SSE] stream started (proxy: %s)", proxyInfo)
+	} else {
+		log.Printf("[SSE] stream started (direct connection)")
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	// Increase buffer size for large SSE lines
@@ -37,7 +44,7 @@ func streamSSE(resp *http.Response, w http.ResponseWriter, thinkingTimeout time.
 		if !hasContent {
 			if m := contentPattern.FindSubmatch(lineWithNL); m != nil {
 				// Skip if preceded by "reasoning_" (e.g. "reasoning_content" field)
-				matchStart := len(lineWithNL) - len(lineWithNL) + bytes.Index(lineWithNL, m[0])
+				matchStart := bytes.Index(lineWithNL, m[0])
 				if matchStart >= 10 && string(lineWithNL[matchStart-10:matchStart]) == "reasoning_" {
 					// skip
 				} else {
@@ -51,7 +58,11 @@ func streamSSE(resp *http.Response, w http.ResponseWriter, thinkingTimeout time.
 
 		if _, err := w.Write(lineWithNL); err != nil {
 			// Client disconnected — can't send [DONE], just return
-			log.Printf("[SSE] client write error after %d lines: %v", totalLines, err)
+			if proxyInfo != "" {
+				log.Printf("[SSE] client write error after %d lines: %v (proxy: %s)", totalLines, err, proxyInfo)
+			} else {
+				log.Printf("[SSE] client write error after %d lines: %v", totalLines, err)
+			}
 			return err
 		}
 
@@ -67,10 +78,18 @@ func streamSSE(resp *http.Response, w http.ResponseWriter, thinkingTimeout time.
 	// Without this, client hangs forever waiting for more data.
 	if err := scanner.Err(); err != nil && err != io.EOF {
 		// Upstream connection dropped or timed out mid-stream.
-		log.Printf("[SSE] upstream read error after %d lines (content seen: %v): %v", totalLines, hasContent, err)
+		if proxyInfo != "" {
+			log.Printf("[SSE] upstream read error after %d lines (content seen: %v, proxy: %s): %v", totalLines, hasContent, proxyInfo, err)
+		} else {
+			log.Printf("[SSE] upstream read error after %d lines (content seen: %v): %v", totalLines, hasContent, err)
+		}
 	} else {
 		// Normal EOF — upstream closed connection (possibly without sending [DONE])
-		log.Printf("[SSE] upstream EOF after %d lines (content seen: %v, elapsed: %v)", totalLines, hasContent, time.Since(thinkingStart))
+		if proxyInfo != "" {
+			log.Printf("[SSE] upstream EOF after %d lines (content seen: %v, elapsed: %v, proxy: %s)", totalLines, hasContent, time.Since(thinkingStart), proxyInfo)
+		} else {
+			log.Printf("[SSE] upstream EOF after %d lines (content seen: %v, elapsed: %v)", totalLines, hasContent, time.Since(thinkingStart))
+		}
 	}
 	sendDone(w)
 	return nil

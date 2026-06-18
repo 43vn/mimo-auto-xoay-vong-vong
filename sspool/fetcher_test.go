@@ -11,22 +11,16 @@ func TestFetchFromShadowmere(t *testing.T) {
 	// Mock shadowmere API
 	data := []shadowmereServer{
 		{
-			ID:          1,
-			Server:      "1.2.3.4",
-			ServerPort:  8388,
-			Password:    "pass1",
-			Method:      "aes-256-gcm",
-			Alive:       true,
-			Country:     "US",
+			Server:     "1.2.3.4",
+			ServerPort: 8388,
+			Password:   "pass1",
+			Method:     "aes-256-gcm",
 		},
 		{
-			ID:          2,
-			Server:      "5.6.7.8",
-			ServerPort:  443,
-			Password:    "pass2",
-			Method:      "chacha20-ietf-poly1305",
-			Alive:       true,
-			Country:     "DE",
+			Server:     "5.6.7.8",
+			ServerPort: 443,
+			Password:   "pass2",
+			Method:     "chacha20-ietf-poly1305",
 		},
 	}
 
@@ -70,9 +64,9 @@ func TestFetchFromShadowmere(t *testing.T) {
 func TestFetchFromShadowmereDedup(t *testing.T) {
 	// API returns duplicates
 	data := []shadowmereServer{
-		{ID: 1, Server: "1.2.3.4", ServerPort: 8388, Password: "pass1", Method: "aes-256-gcm", Alive: true},
-		{ID: 2, Server: "1.2.3.4", ServerPort: 8388, Password: "pass1", Method: "aes-256-gcm", Alive: true},
-		{ID: 3, Server: "1.2.3.4", ServerPort: 8388, Password: "pass1", Method: "aes-256-gcm", Alive: true},
+		{Server: "1.2.3.4", ServerPort: 8388, Password: "pass1", Method: "aes-256-gcm"},
+		{Server: "1.2.3.4", ServerPort: 8388, Password: "pass1", Method: "aes-256-gcm"},
+		{Server: "1.2.3.4", ServerPort: 8388, Password: "pass1", Method: "aes-256-gcm"},
 	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

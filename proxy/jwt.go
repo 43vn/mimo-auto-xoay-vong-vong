@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ type JWTManager struct {
 	bootstrapURL string
 	fingerprint  string
 	httpClient   *http.Client
+	customDo     func(url, contentType string, body io.Reader) (*http.Response, error)
 }
 
 // NewJWTManager creates a JWTManager that fetches tokens from the given bootstrap URL.
@@ -86,7 +88,12 @@ func (m *JWTManager) fetch() (string, error) {
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
-	resp, err := m.httpClient.Post(m.bootstrapURL, "application/json", bytes.NewReader(body))
+	var resp *http.Response
+	if m.customDo != nil {
+		resp, err = m.customDo(m.bootstrapURL, "application/json", bytes.NewReader(body))
+	} else {
+		resp, err = m.httpClient.Post(m.bootstrapURL, "application/json", bytes.NewReader(body))
+	}
 	if err != nil {
 		return "", fmt.Errorf("bootstrap request: %w", err)
 	}

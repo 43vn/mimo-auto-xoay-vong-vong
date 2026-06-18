@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -181,5 +182,88 @@ func TestJWTManagerBodyFormat(t *testing.T) {
 	expectedBody := `{"client":"test-fp"}`
 	if string(receivedBody) != expectedBody {
 		t.Errorf("request body = %s, want %s", string(receivedBody), expectedBody)
+	}
+}
+
+func TestJWTManagerCustomDo(t *testing.T) {
+	called := false
+	m := NewJWTManager("http://unused", "test-fp")
+	m.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
+		called = true
+		respBody := `{"jwt":"custom-token-xyz"}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(respBody)),
+			Header:     make(http.Header),
+		}, nil
+	}
+
+	jwt, err := m.Get()
+	if err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if !called {
+		t.Error("customDo was not called")
+	}
+	if jwt != "custom-token-xyz" {
+		t.Errorf("Get() = %q, want %q", jwt, "custom-token-xyz")
+	}
+}
+
+func TestJWTManagerCustomDoNil(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"jwt":"fallback-token"}`)
+	}))
+	defer srv.Close()
+
+	m := NewJWTManager(srv.URL+"/api/free-ai/bootstrap", "test-fp")
+	// customDo left nil — should use httpClient.Post
+
+	jwt, err := m.Get()
+	if err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("HTTP server called %d times, want 1", callCount)
+	}
+	if jwt != "fallback-token" {
+		t.Errorf("Get() = %q, want %q", jwt, "fallback-token")
+	}
+}
+
+func TestJWTManagerCustomDoError(t *testing.T) {
+	m := NewJWTManager("http://unused", "test-fp")
+	m.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy error")
+	}
+
+	_, err := m.Get()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "proxy error") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "proxy error")
+	}
+}
+
+func TestJWTManagerCustomDoNon200(t *testing.T) {
+	m := NewJWTManager("http://unused", "test-fp")
+	m.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"internal"}`)),
+			Header:     make(http.Header),
+		}, nil
+	}
+
+	_, err := m.Get()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "bootstrap returned status 500") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "bootstrap returned status 500")
 	}
 }

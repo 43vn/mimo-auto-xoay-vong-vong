@@ -9,25 +9,16 @@ import (
 
 // shadowmereServer represents a single server entry from the shadowmere.xyz API.
 type shadowmereServer struct {
-	ID          int      `json:"id"`
-	Server      string   `json:"server"`
-	ServerPort  int      `json:"server_port"`
-	Password    string   `json:"password"`
-	Method      string   `json:"method"`
-	Protocol    string   `json:"protocol"`
-	Alive       bool     `json:"alive"`
-	Country     string   `json:"country"`
-	Tags        []string `json:"tags"`
-	Delay       int      `json:"delay"`
-	RateLimit   *int     `json:"rate_limit"`
-	AliveSince  string   `json:"alive_since"`
-	LastCheck   string   `json:"last_check"`
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"`
+	Server     string `json:"server"`
+	ServerPort int    `json:"server_port"`
+	Password   string `json:"password"`
+	Method     string `json:"method"`
 }
 
 // FetchFromShadowmere fetches SS server list from the shadowmere.xyz API,
 // parses the JSON response, deduplicates, and returns SSConfig slice.
+// The API returns a flat list — we pass ALL servers to the health checker
+// which determines which ones are actually alive via TCP dial.
 func FetchFromShadowmere(apiURL string) ([]SSConfig, error) {
 	resp, err := http.Get(apiURL)
 	if err != nil {
@@ -49,9 +40,6 @@ func FetchFromShadowmere(apiURL string) ([]SSConfig, error) {
 	seen := make(map[string]bool)
 	servers := make([]SSConfig, 0, len(raw))
 	for _, s := range raw {
-		if !s.Alive {
-			continue
-		}
 		cfg := SSConfig{
 			Server:   s.Server,
 			Port:     s.ServerPort,

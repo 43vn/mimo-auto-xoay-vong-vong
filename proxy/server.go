@@ -41,10 +41,12 @@ const (
 
 // Options configures the Server.
 type Options struct {
-	DisableRateLimit    bool          // skip local rate limiter; rely on upstream only
-	MinInterval         time.Duration // minimum interval between local requests (0 = disabled)
-	ProxyTimeout        time.Duration // total timeout for non-streaming requests (0 = default)
-	RateLimitRetryDelay time.Duration // delay between 429 retry attempts (0 = default 120s)
+	DisableRateLimit    bool              // skip local rate limiter; rely on upstream only
+	MinInterval         time.Duration     // minimum interval between local requests (0 = disabled)
+	ProxyTimeout        time.Duration     // total timeout for non-streaming requests (0 = default)
+	RateLimitRetryDelay time.Duration     // delay between 429 retry attempts (0 = default 120s)
+	SmartRouter         *SmartRouter      // for custom/fallback-proxy modes (may be nil)
+	FallbackHandler     *FallbackHandler  // for fallback-proxy mode (may be nil)
 }
 
 // Server is the HTTP proxy server that forwards requests to the upstream API.
@@ -60,6 +62,8 @@ type Server struct {
 	httpServer          *http.Server
 	proxyTimeout        time.Duration
 	rateLimitRetryDelay time.Duration
+	smartRouter         *SmartRouter      // for custom/fallback-proxy modes
+	fallbackHandler     *FallbackHandler  // for fallback-proxy mode
 }
 
 // NewServer creates a new proxy Server.
@@ -82,6 +86,8 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 		baseURL:             BaseURL,
 		proxyTimeout:        proxyTimeout,
 		rateLimitRetryDelay: rateLimitRetryDelay,
+		smartRouter:         opts.SmartRouter,
+		fallbackHandler:     opts.FallbackHandler,
 	}
 	if opts.DisableRateLimit {
 		s.rateLimiter = nil
@@ -103,6 +109,33 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
 	}
+
+	// Route JWT bootstrap through SS tunnel when available
+	jwtMgr.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
+		var client *http.Client
+
+		if s.rotator != nil && s.rotator.Len() > 0 {
+			upstreamAddr := s.rotator.Current()
+			if upstreamAddr != "" {
+				dialer := s.createSSDialer(upstreamAddr)
+				if dialer != nil {
+					client = &http.Client{
+						Timeout: 15 * time.Second,
+						Transport: &http.Transport{
+							DialContext: dialer.DialContext,
+						},
+					}
+				}
+			}
+		}
+
+		if client == nil {
+			client = &http.Client{Timeout: 15 * time.Second}
+		}
+
+		return client.Post(url, contentType, body)
+	}
+
 	return s
 }
 
@@ -315,11 +348,30 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[429] still 429 after retry %d/%d", attempt+1, RateLimitRetries)
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			log.Printf("[429] all %d retries exhausted", RateLimitRetries)
+			// If FallbackHandler is available, try shadowmere SS pool before giving up
+			if s.fallbackHandler != nil {
+				log.Printf("[429] all %d retries exhausted, trying shadowmere fallback...", RateLimitRetries)
+				s.jwtMgr.Invalidate()
+				newJwt, jwtErr := s.jwtMgr.Get()
+				if jwtErr == nil {
+					upstreamHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", newJwt))
+				}
+				resp.Body.Close()
+				resp, err = s.forwardRequest(chatURL, modifiedBody, upstreamHeaders, isStream)
+				if err == nil && resp.StatusCode != http.StatusTooManyRequests {
+					log.Printf("[429] shadowmere fallback OK (status %d)", resp.StatusCode)
+					goto after429
+				}
+				if resp != nil {
+					resp.Body.Close()
+				}
+			}
+			log.Printf("[429] all retries and fallbacks exhausted")
 			http.Error(w, `{"error":"rate limit exceeded after retries"}`, http.StatusTooManyRequests)
 			return
 		}
 	}
+after429:
 
 	// Forward response headers
 	for key, values := range resp.Header {
@@ -341,7 +393,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		if err := streamSSE(resp, w, ThinkingTimeout); err != nil {
+		proxyInfo := s.currentProxyInfo()
+		if err := streamSSE(resp, w, ThinkingTimeout, proxyInfo); err != nil {
 			log.Printf("[WARN] stream error: %v", err)
 		}
 	} else {
@@ -396,13 +449,23 @@ func injectSystemMessage(body []byte) ([]byte, error) {
 }
 
 // forwardRequest sends an HTTP POST to the upstream URL with the given body and headers.
-// When a Shadowsocks upstream is available via the rotator, the request is tunneled through SS.
+// When a SmartRouter is available (custom/fallback-proxy modes), it selects the best proxy.
+// Otherwise when a rotator with SS upstream is available, the request is tunneled through SS.
 // For streaming requests, no Client.Timeout is set to avoid killing body reads mid-SSE;
 // instead, transport-level timeouts handle connection/header phases only.
 func (s *Server) forwardRequest(url string, body []byte, headers http.Header, isStream bool) (*http.Response, error) {
 	var client *http.Client
 
-	if s.rotator != nil && s.rotator.Len() > 0 {
+	// Phase 1: Try SmartRouter (for custom/fallback-proxy modes with mixed protocols)
+	if s.smartRouter != nil && s.smartRouter.Len() > 0 {
+		best := s.smartRouter.SelectBest()
+		if best != nil && best.Dialer != nil {
+			client = s.buildClient(best.Dialer.DialContext, isStream)
+		}
+	}
+
+	// Phase 2: Fall back to SS rotator (for auto/fallback modes)
+	if client == nil && s.rotator != nil && s.rotator.Len() > 0 {
 		upstreamAddr := s.rotator.Current()
 		if upstreamAddr != "" {
 			dialer := s.createSSDialer(upstreamAddr)
@@ -487,6 +550,20 @@ type deadlineConn struct {
 func (c *deadlineConn) Read(b []byte) (int, error) {
 	c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
 	return c.Conn.Read(b)
+}
+
+// currentProxyInfo returns a human-readable string describing the current proxy configuration.
+func (s *Server) currentProxyInfo() string {
+	if s.smartRouter != nil && s.smartRouter.Len() > 0 {
+		best := s.smartRouter.SelectBest()
+		if best != nil {
+			return fmt.Sprintf("%s://%s (pool: %d alive)", best.Protocol, best.Address, s.smartRouter.Len())
+		}
+	}
+	if s.rotator != nil && s.rotator.Len() > 0 {
+		return fmt.Sprintf("ss://%s (pool: %d)", s.rotator.Current(), s.rotator.Len())
+	}
+	return ""
 }
 
 // createSSDialer creates an SS dialer for the given upstream address.

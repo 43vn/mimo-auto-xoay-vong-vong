@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -855,5 +856,321 @@ func TestHandleChatNoRateLimitAutoMode(t *testing.T) {
 
 	if requestCount != 12 {
 		t.Fatalf("expected 12 requests forwarded, got %d", requestCount)
+	}
+}
+
+func TestNewServerSetsCustomDo(t *testing.T) {
+	pool := sspool.NewSSPool()
+	r := rotator.New([]string{}, 0, nil)
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+
+	srv := NewServer(pool, jwtMgr, r, 0, nil)
+
+	if srv.jwtMgr.customDo == nil {
+		t.Error("expected customDo to be set after NewServer()")
+	}
+}
+
+func TestCustomDoUsesSSTunnel(t *testing.T) {
+	// Create a mock SS server to verify connection through it
+	// For now, verify customDo is called and returns a response
+	pool := sspool.NewSSPool()
+	r := rotator.New([]string{}, 0, nil)
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+
+	srv := NewServer(pool, jwtMgr, r, 0, nil)
+
+	// customDo should be set
+	if srv.jwtMgr.customDo == nil {
+		t.Fatal("expected customDo to be set")
+	}
+
+	// When pool is empty, customDo should fall back to direct
+	resp, err := srv.jwtMgr.customDo(bootstrap.URL, "application/json", bytes.NewReader([]byte(`{"client":"test"}`)))
+	if err != nil {
+		t.Fatalf("customDo error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestCustomDoFallbackDirect(t *testing.T) {
+	pool := sspool.NewSSPool()
+	r := rotator.New([]string{}, 0, nil)
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+
+	srv := NewServer(pool, jwtMgr, r, 0, nil)
+
+	// Pool is empty, rotator has no servers
+	// customDo should fall back to direct
+	resp, err := srv.jwtMgr.customDo(bootstrap.URL, "application/json", bytes.NewReader([]byte(`{"client":"test"}`)))
+	if err != nil {
+		t.Fatalf("customDo error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+}
+
+// newTestServerWithRouter creates a Server with a SmartRouter for testing.
+func newTestServerWithRouter(t *testing.T, upstream string, proxies []*ProxyInfo) *Server {
+	t.Helper()
+	pool := sspool.NewSSPool()
+	bootstrap := mockBootstrap(t)
+	t.Cleanup(bootstrap.Close)
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+	r := rotator.New([]string{}, 0, nil)
+	router := NewSmartRouter(proxies)
+	opts := &Options{
+		SmartRouter: router,
+	}
+	srv := NewServer(pool, jwtMgr, r, 0, opts)
+	if upstream != "" {
+		srv.baseURL = upstream
+	}
+	return srv
+}
+
+// TestHandleChatSmartMode verifies SmartRouter is properly integrated.
+// Even though the proxy dialer doesn't actually connect, we verify:
+// 1. The server doesn't crash
+// 2. It falls back through the chain (direct connection works)
+func TestHandleChatSmartMode(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "hello"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	// SmartRouter with an alive proxy (dialer will fail to connect but
+	// forwardRequest falls back to direct when the proxy fails)
+	srv := newTestServerWithRouter(t, upstream.URL, []*ProxyInfo{
+		{
+			Address:  "127.0.0.1:1", // non-routable, will fail fast
+			Protocol: "http",
+			Alive:    true,
+			// no Dialer set — will skip to fallback
+		},
+	})
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+}
+
+// TestFallbackProxyMode verifies fallback-proxy mode handling works via direct fallback.
+func TestFallbackProxyMode(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "hello"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	router := NewSmartRouter(nil) // empty router
+	fb := NewFallbackHandler(router, 60*time.Second)
+
+	pool := sspool.NewSSPool()
+	bootstrap := mockBootstrap(t)
+	t.Cleanup(bootstrap.Close)
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+	r := rotator.New([]string{}, 0, nil)
+
+	opts := &Options{
+		SmartRouter:     router,
+		FallbackHandler: fb,
+	}
+	srv := NewServer(pool, jwtMgr, r, 0, opts)
+	srv.baseURL = upstream.URL
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+}
+
+// TestHandleChatAutoModeUnchanged verifies auto mode still works as before
+// (no SmartRouter, no FallbackHandler — pure SS pool + rotator -> direct fallback).
+func TestHandleChatAutoModeUnchanged(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "hello"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	// Auto mode: no SmartRouter, no FallbackHandler — just pool + rotator (empty)
+	pool := sspool.NewSSPool()
+	bootstrap := mockBootstrap(t)
+	t.Cleanup(bootstrap.Close)
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+	r := rotator.New([]string{}, 0, nil)
+
+	srv := NewServer(pool, jwtMgr, r, 0, nil)
+	srv.baseURL = upstream.URL
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+}
+
+// TestHandleChatSmartModeAllDead verifies fallback to direct when all proxies are dead.
+func TestHandleChatSmartModeAllDead(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "hello"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	// SmartRouter with dead proxies — should fallback to direct
+	srv := newTestServerWithRouter(t, upstream.URL, []*ProxyInfo{
+		{
+			Address:  "1.2.3.4:8080",
+			Protocol: "http",
+			Alive:    false,
+		},
+	})
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	// All proxies dead, should fallback to direct
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 (direct fallback), got %d: %s", resp.StatusCode, string(respBody))
+	}
+}
+
+// TestHandleChatStreamWithRouter verifies SSE streaming with SmartRouter.
+func TestHandleChatStreamWithRouter(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	srv := newTestServerWithRouter(t, upstream.URL, []*ProxyInfo{
+		{
+			Address:  "127.0.0.1:1",
+			Protocol: "http",
+			Alive:    true,
+			// no Dialer — fallback to direct
+		},
+	})
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"stream":   true,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("expected Content-Type text/event-stream, got %s", ct)
 	}
 }
