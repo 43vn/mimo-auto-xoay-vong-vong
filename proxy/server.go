@@ -41,23 +41,25 @@ const (
 
 // Options configures the Server.
 type Options struct {
-	DisableRateLimit bool          // skip local rate limiter; rely on upstream only
-	MinInterval      time.Duration // minimum interval between local requests (0 = disabled)
-	ProxyTimeout     time.Duration // total timeout for non-streaming requests (0 = default)
+	DisableRateLimit    bool          // skip local rate limiter; rely on upstream only
+	MinInterval         time.Duration // minimum interval between local requests (0 = disabled)
+	ProxyTimeout        time.Duration // total timeout for non-streaming requests (0 = default)
+	RateLimitRetryDelay time.Duration // delay between 429 retry attempts (0 = default 120s)
 }
 
 // Server is the HTTP proxy server that forwards requests to the upstream API.
 type Server struct {
-	pool         *sspool.SSPool
-	jwtMgr       *JWTManager
-	rateLimiter  *RateLimiter
-	rotator      *rotator.Rotator
-	semaphore    chan struct{}
-	fingerprint  string
-	port         int
-	baseURL      string // override for testing
-	httpServer   *http.Server
-	proxyTimeout time.Duration
+	pool                *sspool.SSPool
+	jwtMgr              *JWTManager
+	rateLimiter         *RateLimiter
+	rotator             *rotator.Rotator
+	semaphore           chan struct{}
+	fingerprint         string
+	port                int
+	baseURL             string // override for testing
+	httpServer          *http.Server
+	proxyTimeout        time.Duration
+	rateLimitRetryDelay time.Duration
 }
 
 // NewServer creates a new proxy Server.
@@ -67,17 +69,19 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 	}
 	minInt := opts.MinInterval
 	proxyTimeout := opts.ProxyTimeout
+	rateLimitRetryDelay := opts.RateLimitRetryDelay
 
 	fp := generateFingerprint()
 	s := &Server{
-		pool:         pool,
-		jwtMgr:       jwtMgr,
-		rotator:      r,
-		semaphore:    make(chan struct{}, MaxConcurrent),
-		fingerprint:  fp,
-		port:         port,
-		baseURL:      BaseURL,
-		proxyTimeout: proxyTimeout,
+		pool:                pool,
+		jwtMgr:              jwtMgr,
+		rotator:             r,
+		semaphore:           make(chan struct{}, MaxConcurrent),
+		fingerprint:         fp,
+		port:                port,
+		baseURL:             BaseURL,
+		proxyTimeout:        proxyTimeout,
+		rateLimitRetryDelay: rateLimitRetryDelay,
 	}
 	if opts.DisableRateLimit {
 		s.rateLimiter = nil
@@ -86,6 +90,9 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 	}
 	if s.proxyTimeout <= 0 {
 		s.proxyTimeout = ProxyTimeout
+	}
+	if s.rateLimitRetryDelay <= 0 {
+		s.rateLimitRetryDelay = RateLimitRetryDelay
 	}
 	// Initialize httpServer here so the field is set before any goroutine reads it.
 	mux := http.NewServeMux()
@@ -279,8 +286,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if s.rotator != nil {
 				idx = s.rotator.Index()
 			}
-			log.Printf("[429] rotate -> proxy[%d/%d] %s, waiting %ds...", idx, poolLen, nextAddr, RateLimitRetryDelay/time.Second)
-			time.Sleep(RateLimitRetryDelay)
+			log.Printf("[429] rotate -> proxy[%d/%d] %s, waiting %ds...", idx, poolLen, nextAddr, s.rateLimitRetryDelay/time.Second)
+			time.Sleep(s.rateLimitRetryDelay)
 
 			// Refresh JWT (like Python: invalidate_jwt + get_jwt)
 			s.jwtMgr.Invalidate()

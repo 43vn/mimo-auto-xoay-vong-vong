@@ -88,8 +88,10 @@ func main() {
 	opts := &proxy.Options{
 		DisableRateLimit: *disableRateLimit,
 	}
-	// mode=auto disables the 2s min-interval between requests
+	// mode=auto: disable local rate limiter entirely (rely on upstream 429 + rotation)
+	// other modes: disable 2s min-interval only
 	if *mode == "auto" {
+		opts.DisableRateLimit = true
 		opts.MinInterval = 0
 	} else {
 		opts.MinInterval = 2 * time.Second
@@ -306,10 +308,7 @@ func generateFingerprint() string {
 // rateLimitDesc returns a human-readable rate limit description.
 func rateLimitDesc(disabled bool, mode string) string {
 	if disabled {
-		return "disabled (upstream only)"
-	}
-	if mode == "auto" {
-		return "enabled (min-interval disabled for auto mode)"
+		return "disabled (upstream only, rotate on 429)"
 	}
 	return "enabled (2s min-interval)"
 }

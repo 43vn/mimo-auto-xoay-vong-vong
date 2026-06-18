@@ -679,3 +679,136 @@ func TestHandleChatMalformedJSON(t *testing.T) {
 		t.Fatalf("expected status 400, got %d", resp.StatusCode)
 	}
 }
+
+// TestHandleChatUpstream429Rotate verifies that when upstream returns 429,
+// the proxy rotates to the next SS proxy and retries.
+func TestHandleChatUpstream429Rotate(t *testing.T) {
+	requestCount := 0
+	// Mock upstream: return 429 on first request, 200 on retry
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":"rate limit"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "ok after rotate"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	// Empty SSPool — createSSDialer returns nil → falls through to default HTTP client
+	// (avoids trying to connect through non-existent SS server)
+	pool := sspool.NewSSPool()
+
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+
+	// Rotator with 2 addresses to trigger rotation logic
+	addrs := []string{"1.1.1.1:8388", "2.2.2.2:8388"}
+	rotateLog := make(chan string, 10)
+	r := rotator.New(addrs, 0, func(addr string) {
+		rotateLog <- addr
+	})
+
+	srv := NewServer(pool, jwtMgr, r, 0, &Options{
+		RateLimitRetryDelay: 10 * time.Millisecond, // fast retry for test
+	})
+	srv.baseURL = upstream.URL
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	// Should succeed after rotation
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 after rotate, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Verify upstream was called twice (first 429, then retry)
+	if requestCount != 2 {
+		t.Fatalf("expected upstream to be called 2 times, got %d", requestCount)
+	}
+
+	// Verify rotation happened
+	select {
+	case addr := <-rotateLog:
+		t.Logf("proxy rotated to: %s", addr)
+	default:
+		t.Fatal("expected proxy rotation but none occurred")
+	}
+}
+
+// TestHandleChatNoRateLimitAutoMode verifies that auto mode disables local rate limiter.
+// Requests should go through to upstream even if they exceed the local rate limit window.
+func TestHandleChatNoRateLimitAutoMode(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "ok"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	// Empty pool + empty rotator — no SS dialing, direct HTTP to mock upstream
+	pool := sspool.NewSSPool()
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+	r := rotator.New([]string{}, 0, nil)
+
+	// DisableRateLimit = true (simulates auto mode)
+	srv := NewServer(pool, jwtMgr, r, 0, &Options{
+		DisableRateLimit: true,
+	})
+	srv.baseURL = upstream.URL
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	// Send more requests than RateLimitMax (8) — should all pass with rate limit disabled
+	for i := 0; i < 12; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		srv.handleChat(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			t.Fatalf("request %d: expected 200, got %d: %s", i+1, resp.StatusCode, string(respBody))
+		}
+		resp.Body.Close()
+	}
+
+	if requestCount != 12 {
+		t.Fatalf("expected 12 requests forwarded, got %d", requestCount)
+	}
+}
