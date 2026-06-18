@@ -286,7 +286,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if s.rotator != nil {
 				idx = s.rotator.Index()
 			}
-			log.Printf("[429] rotate -> proxy[%d/%d] %s, waiting %ds...", idx, poolLen, nextAddr, s.rateLimitRetryDelay/time.Second)
+			if poolLen == 0 {
+				log.Printf("[429] no proxy available (pool: 0), waiting %ds...", s.rateLimitRetryDelay/time.Second)
+			} else {
+				log.Printf("[429] rotate -> proxy[%d/%d] %s, waiting %ds...", idx, poolLen, nextAddr, s.rateLimitRetryDelay/time.Second)
+			}
 			time.Sleep(s.rateLimitRetryDelay)
 
 			// Refresh JWT (like Python: invalidate_jwt + get_jwt)

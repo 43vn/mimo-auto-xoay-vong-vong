@@ -1,0 +1,44 @@
+# Git
+.git/
+.gitignore
+
+# CI/CD and build
+.github/
+worktrees/
+plans/
+Makefile
+
+# Node
+node_modules/
+
+# Documentation
+*.md
+LICENSE
+
+# IDE and editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Agent and skill mirrors
+.opencode/
+.claude/
+.codex/
+.agents/
+agents/
+skills/
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test files
+*_test.go
+
+# Go build cache
+vendor/

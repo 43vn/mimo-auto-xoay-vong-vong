@@ -152,3 +152,77 @@ func TestRotatorLen(t *testing.T) {
 		t.Errorf("Len(): got %d, want 2", got)
 	}
 }
+
+func TestRotatorUpdate(t *testing.T) {
+	r := New([]string{"a", "b", "c"}, 0, nil)
+
+	// Advance index to 1
+	r.Next() // returns "a", index now 1
+
+	// Replace pool
+	r.Update([]string{"x", "y"})
+
+	if got := r.Len(); got != 2 {
+		t.Errorf("Len() after Update: got %d, want 2", got)
+	}
+
+	if got := r.Current(); got != "x" {
+		t.Errorf("Current() after Update: got %q, want %q", got, "x")
+	}
+}
+
+func TestRotatorUpdateEmpty(t *testing.T) {
+	r := New([]string{"a", "b"}, 0, nil)
+
+	r.Update([]string{})
+
+	if got := r.Len(); got != 0 {
+		t.Errorf("Len() after Update([]): got %d, want 0", got)
+	}
+
+	if got := r.Current(); got != "" {
+		t.Errorf("Current() after Update([]): got %q, want %q", got, "")
+	}
+}
+
+func TestRotatorUpdateResetsIndex(t *testing.T) {
+	r := New([]string{"a", "b", "c", "d", "e"}, 0, nil)
+
+	// Advance index to 3
+	r.Next() // 0 -> 1
+	r.Next() // 1 -> 2
+	r.Next() // 2 -> 3
+
+	// Replace pool with 2 items
+	r.Update([]string{"a", "b"})
+
+	if got := r.Index(); got != 0 {
+		t.Errorf("Index() after Update: got %d, want 0", got)
+	}
+}
+
+func TestRotatorUpdateConcurrent(t *testing.T) {
+	r := New([]string{"a"}, 0, nil)
+	done := make(chan struct{})
+
+	for i := 0; i < 10; i++ {
+		go func(n int) {
+			defer func() { done <- struct{}{} }()
+			// Each goroutine calls Update with a different slice
+			s := make([]string, n)
+			for j := 0; j < n; j++ {
+				s[j] = "x"
+			}
+			r.Update(s)
+		}(i)
+	}
+
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+
+	// Just verify the final state is valid
+	if got := r.Index(); got != 0 {
+		t.Errorf("Index() after concurrent updates: got %d, want 0", got)
+	}
+}

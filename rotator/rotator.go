@@ -97,6 +97,15 @@ func (r *Rotator) Index() int {
 	return r.index
 }
 
+// Update replaces the pool with a new set of addresses and resets
+// the index to 0. Safe for concurrent use.
+func (r *Rotator) Update(newPool []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pool = newPool
+	r.index = 0
+}
+
 func (r *Rotator) listener() {
 	defer r.wg.Done()
 

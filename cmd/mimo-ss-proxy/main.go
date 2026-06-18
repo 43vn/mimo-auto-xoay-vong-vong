@@ -21,6 +21,13 @@ var (
 		"direct": true, "auto": true, "custom": true,
 		"fallback": true, "fallback-proxy": true,
 	}
+
+	// Version metadata (set via -ldflags at build time)
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+	repoName  = "unknown"
+	repoVisibility = "unknown"
 )
 
 func main() {
@@ -31,7 +38,14 @@ func main() {
 	proxyFile := flag.String("proxy-file", "", "File containing SS servers (one per line)")
 	saveProxy := flag.String("save-proxy", "", "Save proxy pool to file")
 	disableRateLimit := flag.Bool("disable-rate-limit", false, "Disable local rate limiter window (rely on upstream only)")
+	showVersion := flag.Bool("version", false, "Show version information")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("mimo-ss-proxy %s (commit: %s, built: %s)\n", version, commit, buildTime)
+		fmt.Printf("repo: %s (%s)\n", repoName, repoVisibility)
+		os.Exit(0)
+	}
 
 	if !validModes[*mode] {
 		log.Fatalf("invalid mode %q: must be direct, auto, custom, fallback, or fallback-proxy", *mode)
@@ -113,6 +127,7 @@ func main() {
 			current := allServers(pool)
 			alive := sspool.HealthCheck(current, 5*time.Second)
 			rebuildPoolInPlace(pool, alive)
+			r.Update(poolAddresses(pool))
 		}
 	}()
 
@@ -136,6 +151,7 @@ func main() {
 				}
 				if added > 0 {
 					log.Printf("[Refresh] added %d new upstreams (total: %d)", added, pool.Len())
+					r.Update(poolAddresses(pool))
 				}
 				// Save if requested
 				if *saveProxy != "" {

@@ -757,6 +757,51 @@ func TestHandleChatUpstream429Rotate(t *testing.T) {
 	}
 }
 
+// TestHandleChat429EmptyRotator verifies that when the rotator pool is empty
+// and upstream returns 429, the proxy returns 502 (not panic).
+func TestHandleChat429EmptyRotator(t *testing.T) {
+	// Mock upstream that always returns 429
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit"}`))
+	}))
+	defer upstream.Close()
+
+	pool := sspool.NewSSPool()
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+
+	// Empty rotator — no addresses
+	r := rotator.New([]string{}, 0, nil)
+
+	srv := NewServer(pool, jwtMgr, r, 0, &Options{
+		RateLimitRetryDelay: 10 * time.Millisecond, // fast retry for test
+	})
+	srv.baseURL = upstream.URL
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	// Should not panic. With empty rotator and 429 upstream, retries exhaust → 502 or 429
+	if resp.StatusCode != http.StatusBadGateway && resp.StatusCode != http.StatusTooManyRequests {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 502 or 429, got %d: %s", resp.StatusCode, string(respBody))
+	}
+}
+
 // TestHandleChatNoRateLimitAutoMode verifies that auto mode disables local rate limiter.
 // Requests should go through to upstream even if they exceed the local rate limit window.
 func TestHandleChatNoRateLimitAutoMode(t *testing.T) {
