@@ -249,6 +249,31 @@ func TestJWTManagerCustomDoError(t *testing.T) {
 	}
 }
 
+func TestBootstrapRequestUserAgent(t *testing.T) {
+	var userAgent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"jwt":"test-token-ua"}`)
+	}))
+	defer srv.Close()
+
+	m := NewJWTManager(srv.URL+"/api/free-ai/bootstrap", "test-fp")
+	// customDo left nil — should use httpClient path with User-Agent
+
+	_, err := m.Get()
+	if err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+
+	if userAgent == "" {
+		t.Error("User-Agent header is empty in bootstrap request")
+	}
+	if !strings.Contains(userAgent, "mimocode/0.1.1") {
+		t.Errorf("User-Agent = %q, want to contain %q", userAgent, "mimocode/0.1.1")
+	}
+}
+
 func TestJWTManagerCustomDoNon200(t *testing.T) {
 	m := NewJWTManager("http://unused", "test-fp")
 	m.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
@@ -265,5 +290,53 @@ func TestJWTManagerCustomDoNon200(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bootstrap returned status 500") {
 		t.Errorf("error = %q, want to contain %q", err.Error(), "bootstrap returned status 500")
+	}
+}
+
+func TestJWTManagerBootstrap403Banned(t *testing.T) {
+	// Simulate a banned proxy: customDo detects 403 with proxy addr,
+	// blacklists the proxy, and returns an error to the caller.
+	m := NewJWTManager("http://unused", "test-fp")
+	m.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy banned: bootstrap returned 403")
+	}
+
+	_, err := m.Get()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// The error should contain "403" so the caller can detect it was a 403 response
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "403")
+	}
+	// The error should contain "bootstrap request" (wrapped by fetch())
+	if !strings.Contains(err.Error(), "bootstrap request") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "bootstrap request")
+	}
+}
+
+func TestJWTManagerBootstrap403NoAddr(t *testing.T) {
+	// Simulate a direct connection (no proxy) that got 403.
+	// customDo returns the 403 response as-is — no blacklist.
+	m := NewJWTManager("http://unused", "test-fp")
+	m.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Body:       io.NopCloser(strings.NewReader(`{"error":"forbidden"}`)),
+			Header:     make(http.Header),
+		}, nil
+	}
+
+	_, err := m.Get()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	// The error should contain the standard message (from fetch())
+	if !strings.Contains(err.Error(), "bootstrap returned status 403") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "bootstrap returned status 403")
+	}
+	// The error should NOT contain proxy/banned info for direct connection
+	if strings.Contains(err.Error(), "banned") {
+		t.Errorf("direct 403 error should not mention 'banned', got: %q", err.Error())
 	}
 }

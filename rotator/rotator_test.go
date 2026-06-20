@@ -226,3 +226,123 @@ func TestRotatorUpdateConcurrent(t *testing.T) {
 		t.Errorf("Index() after concurrent updates: got %d, want 0", got)
 	}
 }
+
+// --- Remove method tests ---
+
+func TestRotatorRemoveAddress(t *testing.T) {
+	pool := []string{"a", "b", "c"}
+	r := New(pool, 0, nil)
+
+	// Remove "b"
+	r.Remove("b")
+
+	// Verify pool is now 2 elements
+	if got := r.Len(); got != 2 {
+		t.Fatalf("Len() after Remove: got %d, want 2", got)
+	}
+
+	// Verify Next() cycles through a, c, a, c (b is gone)
+	expected := []string{"a", "c", "a", "c"}
+	for i, want := range expected {
+		got := r.Next()
+		if got != want {
+			t.Errorf("Next() call %d after Remove: got %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestRotatorRemoveNotExist(t *testing.T) {
+	pool := []string{"a", "b", "c"}
+	r := New(pool, 0, nil)
+
+	// Remove non-existent address — should be no-op
+	r.Remove("nonexistent")
+
+	if got := r.Len(); got != 3 {
+		t.Fatalf("Len() after Remove nonexistent: got %d, want 3", got)
+	}
+
+	// Normal operation continues
+	if got := r.Next(); got != "a" {
+		t.Errorf("Next() after Remove nonexistent: got %q, want %q", got, "a")
+	}
+}
+
+func TestRotatorRemoveAdjustsIndex(t *testing.T) {
+	pool := []string{"a", "b", "c", "d"}
+	r := New(pool, 0, nil)
+
+	// Advance to index 2 (current is "c")
+	r.Next() // returns "a", index=1
+	r.Next() // returns "b", index=2
+
+	// Remove "b" (at index 1, before current index=2) → index should decrement to 1
+	r.Remove("b")
+	if got := r.Index(); got != 1 {
+		t.Fatalf("Index() after removing before index: got %d, want 1", got)
+	}
+
+	// Now pool is ["a", "c", "d"], index=1 → current is "c"
+	if got := r.Current(); got != "c" {
+		t.Errorf("Current() after Remove before index: got %q, want %q", got, "c")
+	}
+}
+
+func TestRotatorRemoveAtIndex(t *testing.T) {
+	pool := []string{"a", "b", "c"}
+	r := New(pool, 0, nil)
+
+	// Remove "a" at current index (0)
+	r.Remove("a")
+
+	// Pool is ["b", "c"], index should stay 0 (now points to "b")
+	if got := r.Len(); got != 2 {
+		t.Fatalf("Len() after Remove at index: got %d, want 2", got)
+	}
+
+	// Next should return "b"
+	if got := r.Next(); got != "b" {
+		t.Errorf("Next() after Remove at index: got %q, want %q", got, "b")
+	}
+}
+
+func TestRotatorRemoveLastItem(t *testing.T) {
+	pool := []string{"a", "b", "c"}
+	r := New(pool, 0, nil)
+
+	// Advance to index 2 (current is "c")
+	r.Next() // index=1
+	r.Next() // index=2
+
+	// Remove "c" (last item, index points to it) → index should wrap to 0
+	r.Remove("c")
+
+	if got := r.Len(); got != 2 {
+		t.Fatalf("Len() after Remove last: got %d, want 2", got)
+	}
+	if got := r.Index(); got != 0 {
+		t.Errorf("Index() after removing last item: got %d, want 0", got)
+	}
+
+	// Next should return "a"
+	if got := r.Next(); got != "a" {
+		t.Errorf("Next() after Remove last: got %q, want %q", got, "a")
+	}
+}
+
+func TestRotatorRemoveFromSingleItem(t *testing.T) {
+	pool := []string{"only"}
+	r := New(pool, 0, nil)
+
+	r.Remove("only")
+
+	if got := r.Len(); got != 0 {
+		t.Fatalf("Len() after Remove only item: got %d, want 0", got)
+	}
+	if got := r.Current(); got != "" {
+		t.Errorf("Current() after Remove only: got %q, want %q", got, "")
+	}
+	if got := r.Next(); got != "" {
+		t.Errorf("Next() after Remove only: got %q, want %q", got, "")
+	}
+}

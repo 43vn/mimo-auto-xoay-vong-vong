@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/vincent/mimo-xoay/rotator"
@@ -110,15 +111,35 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 		Handler: mux,
 	}
 
-	// Route JWT bootstrap through SS tunnel when available
+	// Route JWT bootstrap through configured proxy or SS tunnel when available
 	jwtMgr.customDo = func(url, contentType string, body io.Reader) (*http.Response, error) {
 		var client *http.Client
+		var proxyAddr string
+		usedRotator := false
 
-		if s.rotator != nil && s.rotator.Len() > 0 {
+		// Phase 1: Try SmartRouter (for custom/fallback-proxy modes with SOCKS5/HTTP/SS)
+		if s.smartRouter != nil && s.smartRouter.Len() > 0 {
+			best := s.smartRouter.SelectBest()
+			if best != nil && best.Dialer != nil {
+				proxyAddr = best.Address
+				client = &http.Client{
+					Timeout: 15 * time.Second,
+					Transport: &http.Transport{
+						DialContext: best.Dialer.DialContext,
+					},
+				}
+			}
+		}
+
+		// Phase 2: Fallback to SS rotator tunnel
+		if client == nil && s.rotator != nil && s.rotator.Len() > 0 {
 			upstreamAddr := s.rotator.Current()
 			if upstreamAddr != "" {
+				proxyAddr = upstreamAddr
 				dialer := s.createSSDialer(upstreamAddr)
 				if dialer != nil {
+					usedRotator = true
+					proxyAddr = upstreamAddr
 					client = &http.Client{
 						Timeout: 15 * time.Second,
 						Transport: &http.Transport{
@@ -129,11 +150,36 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 			}
 		}
 
+		// Phase 3: Direct connection (no proxy)
 		if client == nil {
+			proxyAddr = ""
 			client = &http.Client{Timeout: 15 * time.Second}
 		}
 
-		return client.Post(url, contentType, body)
+		req, reqErr := http.NewRequest("POST", url, body)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("User-Agent", "mimocode/0.1.1")
+		req.Header.Set("Accept", "*/*")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		// Detect 403 from bootstrap endpoint and blacklist the proxy
+		if resp.StatusCode == http.StatusForbidden && proxyAddr != "" {
+			if s.smartRouter != nil {
+				s.smartRouter.MarkDead(proxyAddr)
+			}
+			if usedRotator && s.rotator != nil {
+				log.Printf("[INFO] proxy %s banned (403 on bootstrap), removing from rotator", proxyAddr)
+				s.rotator.Remove(proxyAddr)
+			}
+		}
+
+		return resp, nil
 	}
 
 	return s
@@ -141,7 +187,7 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 
 // generateFingerprint creates a random hex fingerprint.
 func generateFingerprint() string {
-	b := make([]byte, 16)
+	b := make([]byte, 32)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
@@ -230,15 +276,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Get JWT
 	jwt, err := s.jwtMgr.Get()
 	if err != nil {
-		log.Printf("[WARN] JWT fetch failed: %v", err)
-		http.Error(w, `{"error":"authentication failed"}`, http.StatusUnauthorized)
-		return
+		// If JWT fetch failed due to 403 (proxy banned), invalidate and retry once
+		if strings.Contains(err.Error(), "bootstrap returned status 403") {
+			log.Printf("[INFO] JWT 403 (proxy likely banned), invalidating and retrying...")
+			s.jwtMgr.Invalidate()
+			jwt, err = s.jwtMgr.Get()
+		}
+		if err != nil {
+			log.Printf("[WARN] JWT fetch failed: %v", err)
+			http.Error(w, `{"error":"authentication failed"}`, http.StatusUnauthorized)
+			return
+		}
 	}
 
 	// Build upstream headers
 	upstreamHeaders := http.Header{
 		"Authorization":       {fmt.Sprintf("Bearer %s", jwt)},
-		"User-Agent":          {"mimocode/0.1.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"},
+		"User-Agent":          {"mimocode/0.1.1 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"},
 		"Accept":              {"*/*"},
 		"X-Session-Affinity":  {s.fingerprint},
 		"X-Mimo-Source":       {"mimocode-cli-free"},
@@ -319,12 +373,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if s.rotator != nil {
 				idx = s.rotator.Index()
 			}
-			if poolLen == 0 {
-				log.Printf("[429] no proxy available (pool: 0), waiting %ds...", s.rateLimitRetryDelay/time.Second)
+			if poolLen > 1 {
+				// Rotated to a different proxy — retry immediately with minimal cooldown
+				log.Printf("[429] rotated to proxy[%d/%d] %s, retrying immediately...", idx, poolLen, nextAddr)
+				time.Sleep(1 * time.Second)
+			} else if poolLen == 1 {
+				// Same proxy (pool=1) — wait full delay before retry
+				log.Printf("[429] no rotation possible (pool: 1), waiting %ds...", s.rateLimitRetryDelay/time.Second)
+				time.Sleep(s.rateLimitRetryDelay)
 			} else {
-				log.Printf("[429] rotate -> proxy[%d/%d] %s, waiting %ds...", idx, poolLen, nextAddr, s.rateLimitRetryDelay/time.Second)
+				// No proxy — wait full delay
+				log.Printf("[429] no proxy available (pool: 0), waiting %ds...", s.rateLimitRetryDelay/time.Second)
+				time.Sleep(s.rateLimitRetryDelay)
 			}
-			time.Sleep(s.rateLimitRetryDelay)
 
 			// Refresh JWT (like Python: invalidate_jwt + get_jwt)
 			s.jwtMgr.Invalidate()

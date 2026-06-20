@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -39,6 +42,7 @@ func main() {
 	saveProxy := flag.String("save-proxy", "", "Save proxy pool to file")
 	disableRateLimit := flag.Bool("disable-rate-limit", false, "Disable local rate limiter window (rely on upstream only)")
 	showVersion := flag.Bool("version", false, "Show version information")
+	fastCheck := flag.Bool("fast-check", false, "Enable fast concurrent health check with cancellation and debounce")
 	flag.Parse()
 
 	if *showVersion {
@@ -92,13 +96,18 @@ func main() {
 
 	// Health check at startup
 	if pool.Len() > 0 {
-		alive := sspool.HealthCheck(allServers(pool), 5*time.Second)
-		pool = rebuildPool(alive)
+		var alive []sspool.SSConfig
+		if *fastCheck {
+			alive = sspool.HealthCheckFast(context.Background(), pool.Snapshot(), 5*time.Second, 20)
+		} else {
+			alive = sspool.HealthCheck(pool.Snapshot(), 5*time.Second)
+		}
+		pool.ReplaceAll(alive)
 		log.Printf("[Health] %d upstreams alive after check", pool.Len())
 	}
 
 	// Build rotator pool (string addresses)
-	addresses := poolAddresses(pool)
+	addresses := ssAddresses(pool.Snapshot())
 	r := rotator.New(addresses, 0, func(addr string) {
 		log.Printf("[Rotator] switched to %s", addr)
 	})
@@ -139,11 +148,32 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			current := allServers(pool)
-			alive := sspool.HealthCheck(current, 5*time.Second)
-			rebuildPoolInPlace(pool, alive)
-			r.Update(poolAddresses(pool))
+
+		if *fastCheck {
+			// Fast mode: channel token bucket — only 1 in-flight check at a time
+			token := make(chan struct{}, 1)
+			token <- struct{}{}
+
+			for range ticker.C {
+				select {
+				case <-token:
+					snapshot := pool.Snapshot()
+					alive := sspool.HealthCheckFast(context.Background(), snapshot, 5*time.Second, 20)
+					pool.ReplaceAll(alive)
+					r.Update(ssAddresses(alive))
+					token <- struct{}{}
+				default:
+					log.Println("[Health] previous check still in progress, skipping")
+				}
+			}
+		} else {
+			// Original mode: run health check every tick
+			for range ticker.C {
+				current := pool.Snapshot()
+				alive := sspool.HealthCheck(current, 5*time.Second)
+				pool.ReplaceAll(alive)
+				r.Update(ssAddresses(alive))
+			}
 		}
 	}()
 
@@ -167,7 +197,7 @@ func main() {
 				}
 				if added > 0 {
 					log.Printf("[Refresh] added %d new upstreams (total: %d)", added, pool.Len())
-					r.Update(poolAddresses(pool))
+					r.Update(ssAddresses(pool.Snapshot()))
 				}
 				// Save if requested
 				if *saveProxy != "" {
@@ -264,6 +294,16 @@ func loadFromFile(pool *sspool.SSPool, filePath string) {
 	}
 }
 
+// ssAddresses extracts "host:port" strings from a slice of SSConfig.
+func ssAddresses(configs []sspool.SSConfig) []string {
+	addrs := make([]string, len(configs))
+	for i, c := range configs {
+		addrs[i] = fmt.Sprintf("%s:%d", c.Server, c.Port)
+	}
+	return addrs
+}
+
+// Deprecated: use pool.Snapshot() instead.
 // allServers returns all servers from the pool (snapshot).
 func allServers(pool *sspool.SSPool) []sspool.SSConfig {
 	var servers []sspool.SSConfig
@@ -277,6 +317,7 @@ func allServers(pool *sspool.SSPool) []sspool.SSConfig {
 	return servers
 }
 
+// Deprecated: use pool.ReplaceAll() instead.
 // rebuildPool creates a new pool from alive servers.
 func rebuildPool(alive []sspool.SSConfig) *sspool.SSPool {
 	newPool := sspool.NewSSPool()
@@ -286,6 +327,7 @@ func rebuildPool(alive []sspool.SSConfig) *sspool.SSPool {
 	return newPool
 }
 
+// Deprecated: use pool.ReplaceAll() instead.
 // rebuildPoolInPlace clears and repopulates the pool.
 func rebuildPoolInPlace(pool *sspool.SSPool, alive []sspool.SSConfig) {
 	// Remove all, then add alive
@@ -301,6 +343,7 @@ func rebuildPoolInPlace(pool *sspool.SSPool, alive []sspool.SSConfig) {
 	}
 }
 
+// Deprecated: use ssAddresses(pool.Snapshot()) instead.
 // poolAddresses returns all server addresses as "host:port" strings.
 func poolAddresses(pool *sspool.SSPool) []string {
 	var addrs []string
@@ -438,9 +481,11 @@ func addMixedProxy(uri string, pool *sspool.SSPool, infos *[]*proxy.ProxyInfo) {
 	log.Printf("[Proxy] loaded %s://%s", cfg.Type, cfg.Addr())
 }
 
-// generateFingerprint creates a fingerprint string.
+// generateFingerprint creates a 64-char hex fingerprint (32 random bytes).
 func generateFingerprint() string {
-	return fmt.Sprintf("mimo-%d", time.Now().UnixNano())
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // rateLimitDesc returns a human-readable rate limit description.

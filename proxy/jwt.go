@@ -92,7 +92,14 @@ func (m *JWTManager) fetch() (string, error) {
 	if m.customDo != nil {
 		resp, err = m.customDo(m.bootstrapURL, "application/json", bytes.NewReader(body))
 	} else {
-		resp, err = m.httpClient.Post(m.bootstrapURL, "application/json", bytes.NewReader(body))
+		req, reqErr := http.NewRequest("POST", m.bootstrapURL, bytes.NewReader(body))
+		if reqErr != nil {
+			return "", fmt.Errorf("create bootstrap request: %w", reqErr)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "mimocode/0.1.1")
+		req.Header.Set("Accept", "*/*")
+		resp, err = m.httpClient.Do(req)
 	}
 	if err != nil {
 		return "", fmt.Errorf("bootstrap request: %w", err)
@@ -100,7 +107,8 @@ func (m *JWTManager) fetch() (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("bootstrap returned status %d", resp.StatusCode)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("bootstrap returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
 	}
 
 	var result struct {

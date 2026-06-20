@@ -46,6 +46,23 @@ func (p *SSPool) Remove(key string) {
 	}
 }
 
+// ReplaceAll atomically replaces all servers and resets the round-robin index.
+func (p *SSPool) ReplaceAll(servers []SSConfig) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.servers = servers
+	p.index = 0
+}
+
+// Snapshot returns a copy of all servers for safe concurrent access.
+func (p *SSPool) Snapshot() []SSConfig {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]SSConfig, len(p.servers))
+	copy(result, p.servers)
+	return result
+}
+
 // Get returns the current server without advancing the index.
 // Returns nil if the pool is empty.
 func (p *SSPool) Get() *SSConfig {

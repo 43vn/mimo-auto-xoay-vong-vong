@@ -135,6 +135,29 @@ func (r *Rotator) listener() {
 	}
 }
 
+// Remove removes an address from the rotator pool.
+// If the current index points to an element at or after the removed position,
+// it is adjusted to avoid skipping an element. Safe for concurrent use.
+func (r *Rotator) Remove(addr string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, a := range r.pool {
+		if a == addr {
+			r.pool = append(r.pool[:i], r.pool[i+1:]...)
+			if len(r.pool) == 0 {
+				r.index = 0
+				return
+			}
+			if i < r.index {
+				r.index--
+			} else if i == r.index && r.index >= len(r.pool) {
+				r.index = 0
+			}
+			return
+		}
+	}
+}
+
 func (r *Rotator) rotate() {
 	r.mu.Lock()
 	defer r.mu.Unlock()

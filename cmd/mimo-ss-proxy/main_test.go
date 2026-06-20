@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/vincent/mimo-xoay/rotator"
@@ -102,5 +104,46 @@ func TestStartupZeroServersRotatorEmpty(t *testing.T) {
 	current := r.Current()
 	if current != "" {
 		t.Fatalf("expected Current() to return empty string for empty pool, got %q", current)
+	}
+}
+
+// --- Fingerprint tests ---
+
+// TestGenerateFingerprintLength verifies fingerprint is exactly 64 hex characters.
+func TestGenerateFingerprintLength(t *testing.T) {
+	fp := generateFingerprint()
+	if len(fp) != 64 {
+		t.Errorf("expected fingerprint length 64, got %d (value: %q)", len(fp), fp)
+	}
+}
+
+// TestGenerateFingerprintHex verifies fingerprint contains only valid hex chars [0-9a-f].
+func TestGenerateFingerprintHex(t *testing.T) {
+	fp := generateFingerprint()
+	for i, c := range fp {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			t.Errorf("invalid character at position %d: %q (value: %q)", i, c, fp)
+			break
+		}
+	}
+}
+
+// TestGenerateFingerprintRandomness verifies two calls produce different values.
+func TestGenerateFingerprintRandomness(t *testing.T) {
+	fp1 := generateFingerprint()
+	fp2 := generateFingerprint()
+	if fp1 == fp2 {
+		t.Errorf("expected different fingerprints, got same: %q", fp1)
+	}
+}
+
+// TestFastCheckFlagIsDefined verifies the --fast-check flag is accepted by the binary.
+func TestFastCheckFlagIsDefined(t *testing.T) {
+	// Build the binary to test flag acceptance
+	cmd := exec.Command("go", "run", ".", "--fast-check=false", "--help")
+	output, err := cmd.CombinedOutput()
+	_ = err // go run may exit 2 on --help, that's expected
+	if strings.Contains(string(output), "flag provided but not defined") {
+		t.Errorf("--fast-check flag was rejected as undefined:\n%s", string(output))
 	}
 }

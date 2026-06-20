@@ -3,11 +3,14 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -317,6 +320,108 @@ func TestServerStartAndShutdown(t *testing.T) {
 	// http.ErrServerClosed is expected on graceful shutdown
 	if startErr != nil && startErr != http.ErrServerClosed {
 		t.Fatalf("unexpected error: %v", startErr)
+	}
+}
+
+// TestGenerateFingerprintLength32 verifies fingerprint = 32 bytes = 64 hex chars.
+func TestGenerateFingerprintLength32(t *testing.T) {
+	fp := generateFingerprint()
+	// 32 bytes = 64 hex chars
+	expectedLen := 64
+	if len(fp) != expectedLen {
+		t.Errorf("fingerprint length = %d, want %d (32 bytes = 64 hex chars)", len(fp), expectedLen)
+	}
+	// Also verify it's valid hex
+	if _, err := hex.DecodeString(fp); err != nil {
+		t.Errorf("fingerprint is not valid hex: %v", err)
+	}
+}
+
+// TestUpstreamUserAgent verifies upstream chat request has User-Agent: mimocode/0.1.1 ...
+func TestUpstreamUserAgent(t *testing.T) {
+	var userAgent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "hello"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := newTestServer(t, upstream.URL)
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if userAgent == "" {
+		t.Fatal("User-Agent header is empty in upstream request")
+	}
+	expectedPrefix := "mimocode/0.1.1"
+	if !strings.HasPrefix(userAgent, expectedPrefix) {
+		t.Errorf("User-Agent = %q, want prefix %q", userAgent, expectedPrefix)
+	}
+}
+
+// TestUpstreamXMimoSource verifies upstream request has X-Mimo-Source: mimocode-cli-free.
+func TestUpstreamXMimoSource(t *testing.T) {
+	var xMimoSource string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xMimoSource = r.Header.Get("X-Mimo-Source")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "hello"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := newTestServer(t, upstream.URL)
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if xMimoSource != "mimocode-cli-free" {
+		t.Errorf("X-Mimo-Source = %q, want %q", xMimoSource, "mimocode-cli-free")
 	}
 }
 
@@ -1173,4 +1278,189 @@ func TestHandleChatStreamWithRouter(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("expected Content-Type text/event-stream, got %s", ct)
 	}
+}
+
+// Test429RotateNewProxyNoWait verifies that when the rotator pool has >1 proxy,
+// a 429 triggers rotation and retries immediately (no full rateLimitRetryDelay sleep).
+// Bug: previously the handler always slept 120s even after rotating to a new proxy.
+func Test429RotateNewProxyNoWait(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":"rate limit"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "ok after rotate"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	pool := sspool.NewSSPool()
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+
+	// Pool of 2 proxies → rotation is meaningful
+	addrs := []string{"1.1.1.1:8388", "2.2.2.2:8388"}
+	r := rotator.New(addrs, 0, nil)
+
+	srv := NewServer(pool, jwtMgr, r, 0, &Options{
+		RateLimitRetryDelay: 30 * time.Second, // large delay — test should NOT wait this long
+	})
+	srv.baseURL = upstream.URL
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	start := time.Now()
+	srv.handleChat(w, req)
+	elapsed := time.Since(start)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 after rotate, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if atomic.LoadInt32(&calls) < 2 {
+		t.Fatalf("expected at least 2 upstream calls, got %d", calls)
+	}
+
+	// With rotation (pool > 1), should complete quickly — NOT wait 30s
+	if elapsed > 10*time.Second {
+		t.Errorf("expected fast retry after rotation, took %v (should be < 10s, not ~30s)", elapsed)
+	}
+
+	t.Logf("rotation test completed in %v (calls: %d)", elapsed, atomic.LoadInt32(&calls))
+}
+
+// Test429SingleProxyWait verifies that when the rotator pool has only 1 proxy,
+// a 429 causes the full rateLimitRetryDelay wait (no rotation possible).
+func Test429SingleProxyWait(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit"}`))
+	}))
+	defer upstream.Close()
+
+	pool := sspool.NewSSPool()
+	bootstrap := mockBootstrap(t)
+	defer bootstrap.Close()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+
+	// Pool of 1 proxy → rotation NOT possible
+	addrs := []string{"only-proxy:8388"}
+	r := rotator.New(addrs, 0, nil)
+
+	srv := NewServer(pool, jwtMgr, r, 0, &Options{
+		RateLimitRetryDelay: 3 * time.Second, // short enough for test, but still noticeable
+	})
+	srv.baseURL = upstream.URL
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	start := time.Now()
+	srv.handleChat(w, req)
+	elapsed := time.Since(start)
+
+	// With no rotation (pool = 1), should wait the full delay
+	// RateLimitRetries = 2, so at least 2 × 3s = 6s
+	if elapsed < 5*time.Second {
+		t.Errorf("expected full delay when no rotation, took %v (should be >= 5s)", elapsed)
+	}
+
+	t.Logf("no-rotation test completed in %v (calls: %d)", elapsed, atomic.LoadInt32(&calls))
+}
+
+// TestHandleChatJWT403Retry verifies that when JWT bootstrap returns 403 (proxy banned),
+// handleChat calls Invalidate(), retries Get(), and succeeds on the second attempt.
+func TestHandleChatJWT403Retry(t *testing.T) {
+	var bootstrapCalls int32
+
+	// Mock upstream for the chat API (after JWT succeeds)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "hello after retry"}},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	// Mock bootstrap: first call returns 403 (banned proxy), second call returns valid JWT
+	bootstrap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&bootstrapCalls, 1)
+		if n == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"error":"banned"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		jwt := "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.fake_signature"
+		json.NewEncoder(w).Encode(map[string]string{"jwt": jwt})
+	}))
+	defer bootstrap.Close()
+
+	pool := sspool.NewSSPool()
+	jwtMgr := NewJWTManager(bootstrap.URL, "test-fp")
+	// Rotator with addresses to exercise the SS rotator path in customDo
+	// (createSSDialer returns nil since pool is empty, so falls to direct)
+	r := rotator.New([]string{"1.1.1.1:8388"}, 0, nil)
+
+	srv := NewServer(pool, jwtMgr, r, 0, nil)
+	srv.baseURL = upstream.URL // chat requests go to mock upstream
+
+	body := map[string]interface{}{
+		"model":    "mimo-auto",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.handleChat(w, req)
+
+	resp := w.Result()
+	defer resp.Body.Close()
+
+	// Should succeed after the retry recovers from 403
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 after 403 retry, got %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Bootstrap should have been called at least twice
+	if got := atomic.LoadInt32(&bootstrapCalls); got < 2 {
+		t.Fatalf("expected bootstrap to be called at least 2 times, got %d", got)
+	}
+	t.Logf("bootstrap called %d times (first: 403, second: success)", atomic.LoadInt32(&bootstrapCalls))
 }
