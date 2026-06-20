@@ -11,6 +11,7 @@ HTTP proxy server cung cấp endpoint tương thích OpenAI API, forward request
 - SmartRouter: chọn proxy tốt nhất dựa trên latency (cho custom/fallback-proxy mode)
 - Fallback chain: user pool → shadowmere SS pool → direct
 - Health check background mỗi 60s trên tất cả SS server
+- Fast concurrent health check (`--fast-check`) với cancellation, debounce, max 20 goroutines
 - Auto-refresh pool mỗi 300s (auto/fallback mode)
 - Rate limiter local (sliding window: 8 req/60s, min 2s interval)
 - JWT bootstrap tự động từ upstream API (route qua SS tunnel)
@@ -122,6 +123,7 @@ curl http://localhost:18084/v1/chat/completions \
 | `--proxy-timeout` | `60` | Upstream timeout (giây, 0 = mặc định 60s) |
 | `--save-proxy` | `""` | Lưu proxy pool ra file |
 | `--disable-rate-limit` | `false` | Tắt rate limiter local (chỉ upstream 429) |
+| `--fast-check` | `false` | Bật health check nhanh concurrency (cancellation + debounce, max 20 goroutines) |
 | `--version` | `false` | Hiển thị version + build metadata |
 
 ## Development
@@ -133,6 +135,19 @@ make cover          # Xem coverage
 make vet            # Go vet
 make build-win      # Cross-compile cho Windows
 make run MODE=auto  # Build + chạy
+```
+
+## Systemd User Service
+
+```bash
+make install-service     # Cài systemd user service
+make enable-service      # Enable + start service
+make stop-service        # Stop service
+make disable-service     # Stop + disable service
+make uninstall-service   # Stop + disable + xóa service file
+make rebuild-service     # Stop → rebuild → reinstall → restart
+make service-status      # Xem service status
+make service-logs        # Xem service logs (follow mode)
 ```
 
 ## Docker
@@ -170,14 +185,14 @@ proxy/                # HTTP handlers, JWT, rate limiter, SSE streaming
   └── jwt.go          # JWT bootstrap + cache
 rotator/              # Round-robin address rotator (Update, Trigger)
 sspool/               # SS pool management
-  ├── pool.go         # Thread-safe SS server pool
+  ├── pool.go         # Thread-safe SS server pool (Snapshot, ReplaceAll)
   ├── config.go       # URI parsers (ss://, socks5://, http://, https://)
   ├── dialer_iface.go # ProxyDialer interface
   ├── dialer.go       # Shadowsocks dialer
   ├── socks5_dialer.go# SOCKS5 dialer
   ├── http_dialer.go  # HTTP CONNECT dialer
   ├── fetcher.go      # Shadowmere API fetcher
-  └── health.go       # TCP health check
+  └── health.go       # TCP health check (sequential + fast concurrent)
 ```
 
 ## Release
