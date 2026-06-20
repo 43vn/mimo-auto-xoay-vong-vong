@@ -173,6 +173,9 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 			if s.smartRouter != nil {
 				s.smartRouter.MarkDead(proxyAddr)
 			}
+			if s.pool != nil {
+				s.pool.MarkDead(proxyAddr)
+			}
 			if usedRotator && s.rotator != nil {
 				log.Printf("[INFO] proxy %s banned (403 on bootstrap), removing from rotator", proxyAddr)
 				s.rotator.Remove(proxyAddr)
@@ -353,6 +356,47 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, `{"error":"upstream request failed after JWT refresh"}`, http.StatusBadGateway)
 			return
+		}
+	}
+
+	// Handle 403 — proxy banned, blacklist + rotate + refresh JWT + retry
+	if resp.StatusCode == http.StatusForbidden {
+		log.Printf("[INFO] upstream returned 403, proxy banned, rotating...")
+
+		// Blacklist current proxy
+		if s.rotator != nil && s.rotator.Len() > 0 {
+			currentAddr := s.rotator.Current()
+			if currentAddr != "" {
+				s.rotator.Remove(currentAddr)
+				s.pool.MarkDead(currentAddr)
+			}
+		}
+
+		// Refresh JWT (will use new proxy via customDo)
+		s.jwtMgr.Invalidate()
+		jwt, err = s.jwtMgr.Get()
+		if err != nil {
+			log.Printf("[WARN] JWT refresh after 403 failed: %v", err)
+			http.Error(w, `{"error":"authentication failed"}`, http.StatusUnauthorized)
+			return
+		}
+		upstreamHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", jwt))
+
+		// Rotate to next proxy
+		if s.rotator != nil && s.rotator.Len() > 0 {
+			s.rotator.Next()
+		}
+
+		// Retry
+		resp.Body.Close()
+		resp, err = s.forwardRequest(chatURL, modifiedBody, upstreamHeaders, isStream)
+		if err != nil {
+			log.Printf("[WARN] upstream request failed after 403 retry: %v", err)
+			http.Error(w, `{"error":"upstream request failed after proxy rotation"}`, http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			log.Printf("[WARN] still 403 after proxy rotation and JWT refresh")
 		}
 	}
 

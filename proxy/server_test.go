@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1463,4 +1464,59 @@ func TestHandleChatJWT403Retry(t *testing.T) {
 		t.Fatalf("expected bootstrap to be called at least 2 times, got %d", got)
 	}
 	t.Logf("bootstrap called %d times (first: 403, second: success)", atomic.LoadInt32(&bootstrapCalls))
+}
+
+// realDialer connects to whatever address the HTTP client requests.
+// Used to make actual HTTP connections through SmartRouter in tests.
+type realDialer struct{}
+
+func (d *realDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return new(net.Dialer).DialContext(ctx, network, addr)
+}
+
+// TestCustomDoMarkDeadOn403 verifies that customDo calls pool.MarkDead
+// when the bootstrap endpoint returns 403 with a proxy address.
+func TestCustomDoMarkDeadOn403(t *testing.T) {
+	// Bootstrap that returns 403
+	bootstrap403 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":"forbidden"}`))
+	}))
+	defer bootstrap403.Close()
+
+	pool := sspool.NewSSPool()
+
+	jwtMgr := NewJWTManager(bootstrap403.URL, "test-fp")
+	r := rotator.New([]string{}, 0, nil)
+
+	// SmartRouter with a proxy that has a real dialer (able to connect)
+	proxies := []*ProxyInfo{
+		{
+			Address:  "mock-proxy:9999",
+			Protocol: "http",
+			Dialer:   &realDialer{},
+			Alive:    true,
+		},
+	}
+	router := NewSmartRouter(proxies)
+
+	srv := NewServer(pool, jwtMgr, r, 0, &Options{
+		SmartRouter: router,
+	})
+
+	// Call customDo — SmartRouter should route through the proxy, get 403
+	resp, err := srv.jwtMgr.customDo(bootstrap403.URL, "application/json", bytes.NewReader([]byte(`{"client":"test"}`)))
+	if err != nil {
+		t.Fatalf("customDo error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected status 403, got %d", resp.StatusCode)
+	}
+
+	// Verify pool.MarkDead was called on the proxy address
+	if !pool.IsDead("mock-proxy:9999") {
+		t.Error("pool.MarkDead should have been called on 403, but 'mock-proxy:9999' is not marked dead")
+	}
 }

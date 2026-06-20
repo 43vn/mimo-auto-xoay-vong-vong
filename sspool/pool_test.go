@@ -280,3 +280,175 @@ func TestSSPoolSnapshotIsolation(t *testing.T) {
 		t.Errorf("pool.Get().Server = %q after mutating snapshot, want %q (original)", got.Server, "1.1.1.1")
 	}
 }
+
+// --- Dead address blacklist tests ---
+
+func TestSSPoolMarkDead(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	p.Add(s1)
+	p.MarkDead("1.1.1.1:8388")
+	if !p.IsDead("1.1.1.1:8388") {
+		t.Error("MarkDead: addr should be dead after MarkDead")
+	}
+}
+
+func TestSSPoolMarkDeadIdempotent(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	p.Add(s1)
+	p.MarkDead("1.1.1.1:8388")
+	p.MarkDead("1.1.1.1:8388") // second call must not panic
+	if !p.IsDead("1.1.1.1:8388") {
+		t.Error("MarkDead idempotent: addr should still be dead after second MarkDead")
+	}
+}
+
+func TestSSPoolMarkDeadNotExist(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	p.Add(s1)
+	p.MarkDead("9.9.9.9:9999") // addr not in pool — must not panic
+}
+
+func TestSSPoolSnapshotAliveExcludesDead(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	s2 := SSConfig{Server: "2.2.2.2", Port: 8388, Password: "b", Method: "aes-128-gcm"}
+	s3 := SSConfig{Server: "3.3.3.3", Port: 8388, Password: "c", Method: "chacha20-ietf-poly1305"}
+	p.Add(s1)
+	p.Add(s2)
+	p.Add(s3)
+	p.MarkDead("2.2.2.2:8388")
+
+	alive := p.SnapshotAlive()
+	if len(alive) != 2 {
+		t.Fatalf("SnapshotAlive() len = %d, want 2 (dead excluded)", len(alive))
+	}
+	for _, s := range alive {
+		if s.Server == "2.2.2.2" {
+			t.Error("SnapshotAlive() should exclude dead server 2.2.2.2")
+		}
+	}
+}
+
+func TestSSPoolSnapshotIncludesDead(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	s2 := SSConfig{Server: "2.2.2.2", Port: 8388, Password: "b", Method: "aes-128-gcm"}
+	p.Add(s1)
+	p.Add(s2)
+	p.MarkDead("2.2.2.2:8388")
+
+	snap := p.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("Snapshot() len = %d, want 2 (dead included)", len(snap))
+	}
+}
+
+func TestSSPoolIsDead(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	p.Add(s1)
+
+	if p.IsDead("1.1.1.1:8388") {
+		t.Error("IsDead before MarkDead should be false")
+	}
+
+	p.MarkDead("1.1.1.1:8388")
+	if !p.IsDead("1.1.1.1:8388") {
+		t.Error("IsDead after MarkDead should be true")
+	}
+
+	p.UnmarkDead("1.1.1.1:8388")
+	if p.IsDead("1.1.1.1:8388") {
+		t.Error("IsDead after UnmarkDead should be false")
+	}
+}
+
+func TestSSPoolUnmarkDead(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	p.Add(s1)
+	p.MarkDead("1.1.1.1:8388")
+
+	if !p.IsDead("1.1.1.1:8388") {
+		t.Fatal("precondition: addr should be dead after MarkDead")
+	}
+
+	p.UnmarkDead("1.1.1.1:8388")
+	if p.IsDead("1.1.1.1:8388") {
+		t.Error("UnmarkDead: addr should not be dead after UnmarkDead")
+	}
+}
+
+func TestSSPoolSnapshotAliveNoAutoUnban(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	s2 := SSConfig{Server: "2.2.2.2", Port: 8388, Password: "b", Method: "aes-128-gcm"}
+	p.Add(s1)
+	p.Add(s2)
+
+	// Mark dead — should stay dead permanently (no auto-unban)
+	p.MarkDead("1.1.1.1:8388")
+
+	alive := p.SnapshotAlive()
+	if len(alive) != 1 {
+		t.Fatalf("SnapshotAlive() len = %d, want 1 (dead addr stays dead)", len(alive))
+	}
+	if alive[0].Server != "2.2.2.2" {
+		t.Errorf("SnapshotAlive()[0].Server = %q, want %q", alive[0].Server, "2.2.2.2")
+	}
+}
+
+func TestSSPoolMarkDeadReplaceAll(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	s2 := SSConfig{Server: "2.2.2.2", Port: 8388, Password: "b", Method: "aes-128-gcm"}
+	s3 := SSConfig{Server: "3.3.3.3", Port: 8388, Password: "c", Method: "chacha20-ietf-poly1305"}
+	p.Add(s1)
+	p.Add(s2)
+	p.Add(s3)
+
+	p.MarkDead("2.2.2.2:8388")
+
+	// ReplaceAll with same set
+	p.ReplaceAll([]SSConfig{s1, s2, s3})
+
+	alive := p.SnapshotAlive()
+	if len(alive) != 2 {
+		t.Fatalf("SnapshotAlive() after ReplaceAll len = %d, want 2 (dead still excluded)", len(alive))
+	}
+	for _, s := range alive {
+		if s.Server == "2.2.2.2" {
+			t.Error("SnapshotAlive() should still exclude dead server after ReplaceAll")
+		}
+	}
+}
+
+func TestSSPoolConcurrentMarkDead(t *testing.T) {
+	p := NewSSPool()
+	s1 := SSConfig{Server: "1.1.1.1", Port: 8388, Password: "a", Method: "aes-256-gcm"}
+	s2 := SSConfig{Server: "2.2.2.2", Port: 8388, Password: "b", Method: "aes-128-gcm"}
+	s3 := SSConfig{Server: "3.3.3.3", Port: 8388, Password: "c", Method: "chacha20-ietf-poly1305"}
+	p.Add(s1)
+	p.Add(s2)
+	p.Add(s3)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			switch i % 3 {
+			case 0:
+				p.MarkDead("1.1.1.1:8388")
+			case 1:
+				_ = p.SnapshotAlive()
+			case 2:
+				_ = p.IsDead("2.2.2.2:8388")
+			}
+		}(i)
+	}
+	wg.Wait()
+}

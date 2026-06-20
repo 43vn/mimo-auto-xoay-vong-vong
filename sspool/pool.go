@@ -1,21 +1,26 @@
 package sspool
 
 import (
+	"fmt"
 	"net"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // SSPool is a concurrent-safe pool of Shadowsocks servers with round-robin rotation.
 type SSPool struct {
-	mu      sync.RWMutex
-	servers []SSConfig
-	index   int
+	mu        sync.RWMutex
+	servers   []SSConfig
+	index     int
+	deadAddrs map[string]time.Time
 }
 
 // NewSSPool creates an empty SSPool.
 func NewSSPool() *SSPool {
-	return &SSPool{}
+	return &SSPool{
+		deadAddrs: make(map[string]time.Time),
+	}
 }
 
 // Add adds a server to the pool. Duplicates (same Key) are ignored.
@@ -147,4 +152,41 @@ func (p *SSPool) GetByAddr(addr string) *SSConfig {
 		}
 	}
 	return nil
+}
+
+// MarkDead marks the given host:port address as dead.
+func (p *SSPool) MarkDead(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.deadAddrs[addr] = time.Now()
+}
+
+// UnmarkDead removes the given address from the dead list.
+func (p *SSPool) UnmarkDead(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.deadAddrs, addr)
+}
+
+// IsDead returns true if the given address is currently marked as dead.
+func (p *SSPool) IsDead(addr string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.deadAddrs[addr]
+	return ok
+}
+
+// SnapshotAlive returns a copy of all non-dead servers.
+func (p *SSPool) SnapshotAlive() []SSConfig {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	result := make([]SSConfig, 0, len(p.servers))
+	for _, s := range p.servers {
+		addr := fmt.Sprintf("%s:%d", s.Server, s.Port)
+		if _, dead := p.deadAddrs[addr]; !dead {
+			result = append(result, s)
+		}
+	}
+	return result
 }

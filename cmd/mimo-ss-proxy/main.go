@@ -157,7 +157,7 @@ func main() {
 			for range ticker.C {
 				select {
 				case <-token:
-					snapshot := pool.Snapshot()
+					snapshot := pool.SnapshotAlive()
 					alive := sspool.HealthCheckFast(context.Background(), snapshot, 5*time.Second, 20)
 					pool.ReplaceAll(alive)
 					r.Update(ssAddresses(alive))
@@ -169,7 +169,7 @@ func main() {
 		} else {
 			// Original mode: run health check every tick
 			for range ticker.C {
-				current := pool.Snapshot()
+				current := pool.SnapshotAlive()
 				alive := sspool.HealthCheck(current, 5*time.Second)
 				pool.ReplaceAll(alive)
 				r.Update(ssAddresses(alive))
@@ -197,7 +197,7 @@ func main() {
 				}
 				if added > 0 {
 					log.Printf("[Refresh] added %d new upstreams (total: %d)", added, pool.Len())
-					r.Update(ssAddresses(pool.Snapshot()))
+					r.Update(ssAddresses(pool.SnapshotAlive()))
 				}
 				// Save if requested
 				if *saveProxy != "" {
