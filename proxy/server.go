@@ -11,7 +11,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/vincent/mimo-xoay/rotator"
@@ -26,6 +25,7 @@ const (
 	ProxyTimeout       = 60 * time.Second  // total timeout for non-streaming requests
 	ThinkingTimeout    = 120 * time.Second // abort SSE if no content within this duration
 	TimeoutRetries     = 5
+	JWTRefreshRetries  = 5
 	RateLimitMax       = 8
 	RateLimitWindow    = 60 * time.Second
 	RateLimitMinInt    = 2 * time.Second
@@ -276,20 +276,44 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	isStream = isStream || r.Header.Get("Accept") == "text/event-stream" ||
 		r.Header.Get("x-stream") == "true"
 
-	// Get JWT
-	jwt, err := s.jwtMgr.Get()
+	// Get JWT — retry up to JWTRefreshRetries times with proxy rotation
+	// (bootstrap request goes through proxy; if proxy is bad, rotate and retry)
+	var jwt string
+	for attempt := 0; attempt < JWTRefreshRetries; attempt++ {
+		jwt, err = s.jwtMgr.Get()
+		if err == nil {
+			break
+		}
+
+		// Check if proxy pool is exhausted
+		poolLen := 0
+		if s.rotator != nil {
+			poolLen = s.rotator.Len()
+		}
+		if poolLen == 0 {
+			log.Printf("[JWT] proxy pool empty after %d attempts, giving up", attempt+1)
+			break
+		}
+
+		// Rotate to next proxy for next bootstrap attempt
+		var nextAddr string
+		if s.rotator != nil && poolLen > 0 {
+			nextAddr = s.rotator.Next()
+		}
+		idx := 0
+		if s.rotator != nil {
+			idx = s.rotator.Index()
+		}
+		log.Printf("[JWT] attempt %d/%d failed: %v — rotating to proxy[%d/%d] %s",
+			attempt+1, JWTRefreshRetries, err, idx, poolLen, nextAddr)
+
+		// Invalidate cached JWT so next Get() triggers a fresh bootstrap
+		s.jwtMgr.Invalidate()
+	}
 	if err != nil {
-		// If JWT fetch failed due to 403 (proxy banned), invalidate and retry once
-		if strings.Contains(err.Error(), "bootstrap returned status 403") {
-			log.Printf("[INFO] JWT 403 (proxy likely banned), invalidating and retrying...")
-			s.jwtMgr.Invalidate()
-			jwt, err = s.jwtMgr.Get()
-		}
-		if err != nil {
-			log.Printf("[WARN] JWT fetch failed: %v", err)
-			http.Error(w, `{"error":"authentication failed"}`, http.StatusUnauthorized)
-			return
-		}
+		log.Printf("[WARN] JWT fetch failed after %d attempts: %v", JWTRefreshRetries, err)
+		http.Error(w, `{"error":"authentication failed"}`, http.StatusUnauthorized)
+		return
 	}
 
 	// Build upstream headers
@@ -341,20 +365,59 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Handle 401 — JWT expired
+	// Handle 401 — JWT expired, try refreshing up to JWTRefreshRetries times
+	// (rotate proxy + refresh JWT each attempt, stop early if pool exhausted)
 	if resp.StatusCode == http.StatusUnauthorized {
-		log.Printf("[INFO] upstream returned 401, refreshing JWT")
-		s.jwtMgr.Invalidate()
-		jwt, err = s.jwtMgr.Get()
-		if err != nil {
-			http.Error(w, `{"error":"JWT refresh failed"}`, http.StatusUnauthorized)
-			return
+		for attempt := 0; attempt < JWTRefreshRetries; attempt++ {
+			// Check if proxy pool is exhausted
+			poolLen := 0
+			if s.rotator != nil {
+				poolLen = s.rotator.Len()
+			}
+			if poolLen == 0 {
+				log.Printf("[401] proxy pool empty after %d attempts, giving up", attempt)
+				break
+			}
+
+			// Rotate to next proxy
+			var nextAddr string
+			if s.rotator != nil && poolLen > 0 {
+				nextAddr = s.rotator.Next()
+			}
+			idx := 0
+			if s.rotator != nil {
+				idx = s.rotator.Index()
+			}
+			log.Printf("[401] attempt %d/%d: refreshing JWT + rotating to proxy[%d/%d] %s",
+				attempt+1, JWTRefreshRetries, idx, poolLen, nextAddr)
+
+			// Refresh JWT
+			s.jwtMgr.Invalidate()
+			newJwt, jwtErr := s.jwtMgr.Get()
+			if jwtErr != nil {
+				log.Printf("[401] JWT refresh failed on attempt %d/%d: %v", attempt+1, JWTRefreshRetries, jwtErr)
+				continue
+			}
+			upstreamHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", newJwt))
+
+			// Retry request
+			resp.Body.Close()
+			resp, err = s.forwardRequest(chatURL, modifiedBody, upstreamHeaders, isStream)
+			if err != nil {
+				log.Printf("[401] retry %d/%d failed: %v", attempt+1, JWTRefreshRetries, err)
+				continue
+			}
+			if resp.StatusCode != http.StatusUnauthorized {
+				log.Printf("[401] retry %d/%d OK (status %d)", attempt+1, JWTRefreshRetries, resp.StatusCode)
+				break
+			}
+			log.Printf("[401] still 401 after retry %d/%d", attempt+1, JWTRefreshRetries)
 		}
-		upstreamHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", jwt))
-		resp.Body.Close()
-		resp, err = s.forwardRequest(chatURL, modifiedBody, upstreamHeaders, isStream)
-		if err != nil {
-			http.Error(w, `{"error":"upstream request failed after JWT refresh"}`, http.StatusBadGateway)
+		// If still 401 after all retries, return error to client
+		if resp.StatusCode == http.StatusUnauthorized {
+			log.Printf("[401] all %d retries exhausted, returning 401 to client", JWTRefreshRetries)
+			resp.Body.Close()
+			http.Error(w, `{"error":"JWT refresh failed after retries"}`, http.StatusUnauthorized)
 			return
 		}
 	}
