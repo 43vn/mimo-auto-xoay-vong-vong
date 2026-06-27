@@ -80,11 +80,11 @@ func (r *SmartRouter) SelectNext() *ProxyInfo {
 		if r.filter != nil && r.filter.IsBlacklisted(p.Address) {
 			continue
 		}
-		return p
 		if r.currentIndex == start {
 			// Full circle, no alive proxies
 			return nil
 		}
+		return p
 	}
 }
 
