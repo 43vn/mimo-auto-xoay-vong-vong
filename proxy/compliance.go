@@ -40,6 +40,8 @@ func detectComplianceBlock(body []byte) bool {
 var authErrorPatterns = []string{
 	"invalid token",
 	"invalid_token",
+	"illegal access",
+	"illegal_access",
 	"unauthorized",
 }
 

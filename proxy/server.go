@@ -596,8 +596,8 @@ after429:
 				newJwt, jwtErr := s.jwtMgr.Get()
 				if jwtErr != nil {
 					log.Printf("[COMPLIANCE] JWT refresh failed on retry %d/%d: %v", retry+1, maxRetries, jwtErr)
-					if preResult.BlockReason == "compliance" {
-						// Compliance: blacklist + rotate
+					if preResult.BlockReason == "compliance" || isJWTBanned(jwtErr) {
+						// Compliance or banned: blacklist + rotate
 						if s.rotator != nil && s.rotator.Len() > 0 {
 							deadAddr := s.rotator.RemoveCurrent()
 							if deadAddr != "" {
@@ -605,7 +605,7 @@ after429:
 							}
 						}
 					} else {
-						// Auth: just rotate (don't blacklist)
+						// Auth error (not banned): just rotate
 						if s.rotator != nil && s.rotator.Len() > 0 {
 							s.rotator.RemoveCurrent()
 						}
@@ -1054,6 +1054,15 @@ func (s *Server) isBlacklisted(addr string) bool {
 		return false
 	}
 	return s.blacklistMgr.IsBlacklisted(addr)
+}
+
+// isJWTBanned checks if a JWT refresh error indicates the proxy is banned (403).
+func isJWTBanned(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "403") || strings.Contains(msg, "Illegal access") || strings.Contains(msg, "illegal_access")
 }
 
 // markProxyDead marks the current proxy as dead (temporary, not blacklist)
