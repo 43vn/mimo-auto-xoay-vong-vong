@@ -75,14 +75,16 @@ func (r *SmartRouter) SelectNext() *ProxyInfo {
 		p := r.proxies[r.currentIndex]
 		r.currentIndex = (r.currentIndex + 1) % len(r.proxies)
 		if !p.Alive {
+			if r.currentIndex == start {
+				return nil
+			}
 			continue
 		}
 		if r.filter != nil && r.filter.IsBlacklisted(p.Address) {
+			if r.currentIndex == start {
+				return nil
+			}
 			continue
-		}
-		if r.currentIndex == start {
-			// Full circle, no alive proxies
-			return nil
 		}
 		return p
 	}
