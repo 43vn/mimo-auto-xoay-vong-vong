@@ -158,6 +158,25 @@ func (r *Rotator) Remove(addr string) {
 	}
 }
 
+// RemoveCurrent atomically returns the current address and removes it from the pool.
+// Returns empty string if pool is safe. Safe for concurrent use.
+// This avoids the TOCTOU race between Current() + Remove().
+func (r *Rotator) RemoveCurrent() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pool) == 0 {
+		return ""
+	}
+	addr := r.pool[r.index]
+	r.pool = append(r.pool[:r.index], r.pool[r.index+1:]...)
+	if len(r.pool) == 0 {
+		r.index = 0
+	} else if r.index >= len(r.pool) {
+		r.index = 0
+	}
+	return addr
+}
+
 func (r *Rotator) rotate() {
 	r.mu.Lock()
 	defer r.mu.Unlock()

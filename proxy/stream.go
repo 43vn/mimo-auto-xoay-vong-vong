@@ -14,6 +14,74 @@ import (
 // contentPattern matches "content" : "..." in JSON lines.
 var contentPattern = regexp.MustCompile(`"content"\s*:\s*"((?:[^"\\]|\\.)*)"`)
 
+// streamSSEFromScanner continues streaming from an existing scanner (used after
+// compliance buffer check). It resumes reading from the scanner that already
+// consumed the first N lines, forwarding remaining lines to the client.
+// proxyInfo is optional — if non-empty, it is logged with SSE events for debugging.
+func streamSSEFromScanner(scanner *bufio.Scanner, w http.ResponseWriter, thinkingTimeout time.Duration, proxyInfo string, initialLines int) error {
+	thinkingStart := time.Now()
+	hasContent := false
+	totalLines := initialLines
+
+	if proxyInfo != "" {
+		log.Printf("[SSE] stream resumed from scanner (proxy: %s)", proxyInfo)
+	} else {
+		log.Printf("[SSE] stream resumed from scanner (direct connection)")
+	}
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		lineWithNL := append(line, '\n')
+		totalLines++
+
+		if !hasContent {
+			if m := contentPattern.FindSubmatch(lineWithNL); m != nil {
+				matchStart := bytes.Index(lineWithNL, m[0])
+				if matchStart >= 10 && string(lineWithNL[matchStart-10:matchStart]) == "reasoning_" {
+					// skip
+				} else {
+					val := m[1]
+					if len(val) > 0 && string(val) != "null" {
+						hasContent = true
+					}
+				}
+			}
+		}
+
+		if _, err := w.Write(lineWithNL); err != nil {
+			if proxyInfo != "" {
+				log.Printf("[SSE] client write error after %d lines: %v (proxy: %s)", totalLines, err, proxyInfo)
+			} else {
+				log.Printf("[SSE] client write error after %d lines: %v", totalLines, err)
+			}
+			return err
+		}
+
+		if !hasContent && time.Since(thinkingStart) > thinkingTimeout {
+			log.Printf("[SSE] thinking timeout after %d lines (%v), sending [DONE]", totalLines, time.Since(thinkingStart))
+			sendDone(w)
+			return nil
+		}
+	}
+
+	// Stream ended
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		if proxyInfo != "" {
+			log.Printf("[SSE] upstream read error after %d lines (content seen: %v, proxy: %s): %v", totalLines, hasContent, proxyInfo, err)
+		} else {
+			log.Printf("[SSE] upstream read error after %d lines (content seen: %v): %v", totalLines, hasContent, err)
+		}
+	} else {
+		if proxyInfo != "" {
+			log.Printf("[SSE] upstream EOF after %d lines (content seen: %v, elapsed: %v, proxy: %s)", totalLines, hasContent, time.Since(thinkingStart), proxyInfo)
+		} else {
+			log.Printf("[SSE] upstream EOF after %d lines (content seen: %v, elapsed: %v)", totalLines, hasContent, time.Since(thinkingStart))
+		}
+	}
+	sendDone(w)
+	return nil
+}
+
 // streamSSE proxies SSE chunks from upstream to client with thinking timeout.
 // If no content appears within thinkingTimeout, the stream is aborted with [DONE].
 // ALWAYS sends [DONE] on ANY stream end (EOF, error, timeout) so the client

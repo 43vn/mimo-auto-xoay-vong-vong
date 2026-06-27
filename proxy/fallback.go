@@ -19,6 +19,7 @@ type FallbackHandler struct {
 	refreshInterval  time.Duration
 	fallbackEnabled  bool       // when true, can fall back to shadowmere
 	directOnExhaust  bool       // when true, try direct after all fallbacks
+	poolFilter       sspool.BlacklistFilter // preserved across pool refreshes
 }
 
 // NewFallbackHandler creates a new FallbackHandler.
@@ -119,6 +120,14 @@ func (h *FallbackHandler) HasUserPool() bool {
 	return h.router.Len() > 0
 }
 
+// SetFilter sets a blacklist filter on the shadowmere pool.
+func (h *FallbackHandler) SetFilter(f sspool.BlacklistFilter) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.poolFilter = f
+	h.shadowmerePool.SetFilter(f)
+}
+
 // UserPoolLen returns the number of proxies in the user pool.
 func (h *FallbackHandler) UserPoolLen() int {
 	if h.router == nil {
@@ -143,6 +152,9 @@ func (h *FallbackHandler) refreshShadowmereLocked() {
 	}
 	// Rebuild pool
 	newPool := sspool.NewSSPool()
+	if h.poolFilter != nil {
+		newPool.SetFilter(h.poolFilter)
+	}
 	for _, s := range servers {
 		newPool.Add(s)
 	}

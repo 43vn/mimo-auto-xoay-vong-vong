@@ -1,16 +1,17 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/vincent/mimo-xoay/rotator"
@@ -48,6 +49,7 @@ type Options struct {
 	RateLimitRetryDelay time.Duration     // delay between 429 retry attempts (0 = default 120s)
 	SmartRouter         *SmartRouter      // for custom/fallback-proxy modes (may be nil)
 	FallbackHandler     *FallbackHandler  // for fallback-proxy mode (may be nil)
+	BlacklistMgr        *BlacklistManager // persistent blacklist manager (may be nil)
 }
 
 // Server is the HTTP proxy server that forwards requests to the upstream API.
@@ -56,6 +58,7 @@ type Server struct {
 	jwtMgr              *JWTManager
 	rateLimiter         *RateLimiter
 	rotator             *rotator.Rotator
+	blacklistMgr        *BlacklistManager
 	semaphore           chan struct{}
 	fingerprint         string
 	port                int
@@ -63,8 +66,8 @@ type Server struct {
 	httpServer          *http.Server
 	proxyTimeout        time.Duration
 	rateLimitRetryDelay time.Duration
-	smartRouter         *SmartRouter      // for custom/fallback-proxy modes
-	fallbackHandler     *FallbackHandler  // for fallback-proxy mode
+	smartRouter         *SmartRouter     // for custom/fallback-proxy modes
+	fallbackHandler     *FallbackHandler // for fallback-proxy mode
 }
 
 // NewServer creates a new proxy Server.
@@ -89,6 +92,7 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 		rateLimitRetryDelay: rateLimitRetryDelay,
 		smartRouter:         opts.SmartRouter,
 		fallbackHandler:     opts.FallbackHandler,
+		blacklistMgr:        opts.BlacklistMgr,
 	}
 	if opts.DisableRateLimit {
 		s.rateLimiter = nil
@@ -161,20 +165,20 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 			return nil, reqErr
 		}
 		req.Header.Set("Content-Type", contentType)
-		req.Header.Set("User-Agent", "mimocode/0.1.1")
+		req.Header.Set("User-Agent", "mimocode/0.1.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
 		req.Header.Set("Accept", "*/*")
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
 		}
 
-		// Detect 403 from bootstrap endpoint and blacklist the proxy
+		// Detect 403 from bootstrap endpoint and mark dead the proxy
 		if resp.StatusCode == http.StatusForbidden && proxyAddr != "" {
 			if s.smartRouter != nil {
 				s.smartRouter.MarkDead(proxyAddr)
 			}
 			if s.pool != nil {
-				s.pool.MarkDead(proxyAddr)
+				s.markAddrDead(proxyAddr)
 			}
 			if usedRotator && s.rotator != nil {
 				log.Printf("[INFO] proxy %s banned (403 on bootstrap), removing from rotator", proxyAddr)
@@ -188,11 +192,17 @@ func NewServer(pool *sspool.SSPool, jwtMgr *JWTManager, r *rotator.Rotator, port
 	return s
 }
 
-// generateFingerprint creates a random hex fingerprint.
+// generateFingerprint creates a random alphanumeric fingerprint
+// matching the format <26chars> (mixed case alphanumeric).
 func generateFingerprint() string {
-	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 26)
+	buf := make([]byte, 26)
+	rand.Read(buf)
+	for i := range b {
+		b[i] = chars[int(buf[i])%len(chars)]
+	}
+	return string(b)
 }
 
 
@@ -268,6 +278,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Strip compliance block text from prompt to avoid triggering upstream detector
+	if stripped, stripErr := stripComplianceBlock(modifiedBody); stripErr == nil && len(stripped) > 0 {
+		modifiedBody = stripped
+	}
+
 	// Determine streaming
 	var isStream bool
 	if streamRaw, ok := raw["stream"]; ok {
@@ -319,9 +334,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Build upstream headers
 	upstreamHeaders := http.Header{
 		"Authorization":       {fmt.Sprintf("Bearer %s", jwt)},
-		"User-Agent":          {"mimocode/0.1.1 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"},
+		"User-Agent":          {"mimocode/0.1.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"},
 		"Accept":              {"*/*"},
-		"X-Session-Affinity":  {s.fingerprint},
+		"X-Session-Affinity":  {"ses_" + s.fingerprint},
 		"X-Mimo-Source":       {"mimocode-cli-free"},
 		"Content-Type":        {"application/json"},
 		"Connection":          {"keep-alive"},
@@ -431,7 +446,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			currentAddr := s.rotator.Current()
 			if currentAddr != "" {
 				s.rotator.Remove(currentAddr)
-				s.pool.MarkDead(currentAddr)
+				s.markAddrDead(currentAddr)
 			}
 		}
 
@@ -542,36 +557,453 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 after429:
 
 	// Forward response headers
-	for key, values := range resp.Header {
-		for _, v := range values {
-			w.Header().Add(key, v)
-		}
-	}
+	forwardHeaders(w, resp)
 	// Add CORS
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	if isStream {
+		// Buffer first lines from upstream BEFORE writing anything to client.
+		// Check EACH line immediately for compliance blocks.
+		const complianceCheckLines = 10
+		var complianceBuf []byte
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		linesRead := 0
+		for scanner.Scan() && linesRead < complianceCheckLines {
+			line := scanner.Bytes()
+			lineWithNL := append(line, '\n')
+			complianceBuf = append(complianceBuf, lineWithNL...)
+			linesRead++
+		}
+		// Check for stream error during buffering
+		if scanErr := scanner.Err(); scanErr != nil {
+			log.Printf("[WARN] stream read error during compliance buffer: %v", scanErr)
+		}
+		// Log buffer for debugging (first 500 chars)
+		if len(complianceBuf) > 0 {
+			debugBuf := complianceBuf
+			if len(debugBuf) > 500 {
+				debugBuf = debugBuf[:500]
+			}
+		}
+
+		// Check entire buffer for compliance block (not per-line — message may span multiple lines)
+		// Detect regardless of status code — upstream may return 200/403/441 with compliance text
+		complianceDetected := detectComplianceBlock(complianceBuf)
+
+		// Check for compliance block before sending anything to client
+		if complianceDetected {
+			log.Printf("[COMPLIANCE] compliance block detected in stream (proxy: %s)", s.currentProxyInfo())
+			resp.Body.Close()
+
+			// Blacklist current proxy (atomic remove — advances rotator to next)
+			if s.rotator != nil && s.rotator.Len() > 0 {
+				deadAddr := s.rotator.RemoveCurrent()
+				if deadAddr != "" {
+					s.blacklistAddr(deadAddr)
+				}
+			}
+
+			// Retry with rotated proxy (max 2 retries)
+			const maxComplianceRetries = 5
+			for retry := 0; retry < maxComplianceRetries; retry++ {
+				if s.rotator != nil && s.rotator.Len() == 0 {
+					break
+				}
+
+				// Log current proxy BEFORE refresh
+				if s.rotator != nil {
+					idx := s.rotator.Index()
+					addr := s.rotator.Current()
+					log.Printf("[COMPLIANCE] stream retry %d/%d: using proxy[%d] %s", retry+1, maxComplianceRetries, idx, addr)
+				}
+
+				// Refresh JWT AFTER rotation — fetch through current (new) proxy
+				s.jwtMgr.Invalidate()
+				newJwt, jwtErr := s.jwtMgr.Get()
+				if jwtErr != nil {
+					log.Printf("[COMPLIANCE] JWT refresh failed on retry %d/%d: %v, marking dead + rotating", retry+1, maxComplianceRetries, jwtErr)
+					// This proxy is bad — mark dead + rotate to next
+					if s.rotator != nil && s.rotator.Len() > 0 {
+						deadAddr := s.rotator.RemoveCurrent()
+						if deadAddr != "" {
+							s.markAddrDead(deadAddr)
+						}
+					}
+					continue
+				}
+				upstreamHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", newJwt))
+
+				// Backoff between retries
+				if retry > 0 {
+					time.Sleep(1 * time.Second)
+				}
+
+				resp.Body.Close()
+				resp, err = s.forwardRequest(chatURL, modifiedBody, upstreamHeaders, isStream)
+				if err != nil {
+					log.Printf("[COMPLIANCE] stream retry %d/%d failed: %v", retry+1, maxComplianceRetries, err)
+					resp = nil
+					continue
+				}
+
+				// Buffer first lines from retry response
+				retryBuf := make([]byte, 0, 64*1024)
+				retryScanner := bufio.NewScanner(resp.Body)
+				retryScanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+				retryLines := 0
+				for retryScanner.Scan() && retryLines < complianceCheckLines {
+					line := retryScanner.Bytes()
+					lineWithNL := append(line, '\n')
+					retryBuf = append(retryBuf, lineWithNL...)
+					retryLines++
+				}
+				// Log retry buffer for debugging
+				if len(retryBuf) > 0 {
+					debugBuf := retryBuf
+					if len(debugBuf) > 500 {
+						debugBuf = debugBuf[:500]
+					}
+				}
+
+				// Check entire retry buffer for compliance block
+				if detectComplianceBlock(retryBuf) {
+					log.Printf("[COMPLIANCE] stream retry %d/%d still compliance-blocked", retry+1, maxComplianceRetries)
+					// Blacklist this proxy too (atomic) — advances rotator to next
+					if s.rotator != nil && s.rotator.Len() > 0 {
+						deadAddr := s.rotator.RemoveCurrent()
+						if deadAddr != "" {
+							s.blacklistAddr(deadAddr)
+						}
+					}
+					// JWT will be refreshed at the top of next loop iteration
+					continue
+				}
+
+				// Success — forward headers + buffered data + rest of stream
+				log.Printf("[COMPLIANCE] stream retry %d/%d succeeded (status %d)", retry+1, maxComplianceRetries, resp.StatusCode)
+
+				// Check if retry returned SSE or JSON
+					retryCT := resp.Header.Get("Content-Type")
+					retryIsSSE := false
+					if strings.Contains(retryCT, "text/event-stream") && len(retryBuf) > 0 {
+						retryIsSSE = isValidSSEBuffer(retryBuf)
+					}
+
+				if !retryIsSSE {
+					// JSON error — check for compliance block, then forward as-is
+					retryFullBody := retryBuf
+					if remaining, readErr := io.ReadAll(resp.Body); readErr == nil {
+						retryFullBody = append(retryFullBody, remaining...)
+					}
+					resp.Body.Close()
+
+					if detectComplianceBlock(retryFullBody) {
+						log.Printf("[COMPLIANCE] retry JSON error contains compliance block, blacklisting proxy")
+						if s.rotator != nil && s.rotator.Len() > 0 {
+							deadAddr := s.rotator.RemoveCurrent()
+							if deadAddr != "" {
+								s.blacklistAddr(deadAddr)
+							}
+						}
+					}
+
+					// Forward JSON error to client (no more retries from this path)
+					forwardHeaders(w, resp)
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+					w.WriteHeader(resp.StatusCode)
+					w.Write(retryFullBody)
+					return
+				}
+
+				// SSE stream
+				forwardHeaders(w, resp)
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("Connection", "keep-alive")
+				w.WriteHeader(resp.StatusCode)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				// Write buffered lines
+				w.Write(retryBuf)
+				// Continue streaming from the retry scanner (reuse same scanner)
+				proxyInfo := s.currentProxyInfo()
+				if err := streamSSEFromScanner(retryScanner, w, ThinkingTimeout, proxyInfo, retryLines); err != nil {
+					log.Printf("[WARN] stream error after compliance retry: %v", err)
+					s.markProxyDead(err)
+				}
+				return
+			}
+
+			// All retries exhausted
+			log.Printf("[COMPLIANCE] all stream retries exhausted")
+			http.Error(w, `{"error":"compliance block after proxy rotation"}`, http.StatusForbidden)
+			return
+		}
+
+		// Clean — forward headers + buffered data + continue streaming
+		// Check if upstream actually returned SSE or just JSON error
+		upstreamCT := resp.Header.Get("Content-Type")
+		isSSE := false
+		if strings.Contains(upstreamCT, "text/event-stream") && len(complianceBuf) > 0 {
+			// Validate: at least one line must start with "data:" or "event:" or ":"
+			isSSE = isValidSSEBuffer(complianceBuf)
+		}
+
+		if !isSSE {
+			// Upstream returned JSON error (not SSE)
+			// Check if this JSON error contains compliance block → blacklist + retry
+			fullBody := complianceBuf
+			if remaining, readErr := io.ReadAll(resp.Body); readErr == nil {
+				fullBody = append(fullBody, remaining...)
+			}
+			resp.Body.Close()
+
+			if detectComplianceBlock(fullBody) {
+				log.Printf("[COMPLIANCE] JSON error contains compliance block, blacklisting proxy")
+				if s.rotator != nil && s.rotator.Len() > 0 {
+					deadAddr := s.rotator.RemoveCurrent()
+					if deadAddr != "" {
+						s.blacklistAddr(deadAddr)
+					}
+				}
+
+				// Retry with rotated proxy (max 5 retries)
+				const maxJSONRetries = 5
+				for retry := 0; retry < maxJSONRetries; retry++ {
+					if s.rotator != nil && s.rotator.Len() == 0 {
+						break
+					}
+
+					// Log current proxy
+					if s.rotator != nil {
+						idx := s.rotator.Index()
+						addr := s.rotator.Current()
+						log.Printf("[COMPLIANCE] JSON retry %d/%d: using proxy[%d] %s", retry+1, maxJSONRetries, idx, addr)
+					}
+
+					// Refresh JWT AFTER rotation
+					s.jwtMgr.Invalidate()
+					newJwt, jwtErr := s.jwtMgr.Get()
+					if jwtErr != nil {
+						log.Printf("[COMPLIANCE] JWT refresh failed on JSON retry %d/%d: %v, marking dead + rotating", retry+1, maxJSONRetries, jwtErr)
+						// This proxy is bad — mark dead + rotate to next
+						if s.rotator != nil && s.rotator.Len() > 0 {
+							deadAddr := s.rotator.RemoveCurrent()
+							if deadAddr != "" {
+								s.markAddrDead(deadAddr)
+							}
+						}
+						continue
+					}
+					upstreamHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", newJwt))
+
+					if retry > 0 {
+						time.Sleep(1 * time.Second)
+					}
+
+					retryResp, retryErr := s.forwardRequest(chatURL, modifiedBody, upstreamHeaders, isStream)
+					if retryErr != nil {
+						log.Printf("[COMPLIANCE] JSON retry %d/%d failed: %v", retry+1, maxJSONRetries, retryErr)
+						continue
+					}
+
+					// Check if retry response is SSE or JSON
+					retryCT := retryResp.Header.Get("Content-Type")
+					retryIsSSE := strings.Contains(retryCT, "text/event-stream")
+
+					if retryIsSSE {
+						// Got SSE stream — forward it
+						log.Printf("[COMPLIANCE] JSON retry %d/%d succeeded, got SSE stream", retry+1, maxJSONRetries)
+						for key, values := range retryResp.Header {
+							for _, v := range values {
+								w.Header().Add(key, v)
+							}
+						}
+						w.Header().Set("Access-Control-Allow-Origin", "*")
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.Header().Set("Cache-Control", "no-cache")
+						w.Header().Set("Connection", "keep-alive")
+						w.WriteHeader(retryResp.StatusCode)
+						if flusher, ok := w.(http.Flusher); ok {
+							flusher.Flush()
+						}
+						proxyInfo := s.currentProxyInfo()
+					if err := streamSSE(retryResp, w, ThinkingTimeout, proxyInfo); err != nil {
+						log.Printf("[WARN] stream error after JSON retry: %v", err)
+						s.markProxyDead(err)
+					}
+						return
+					}
+
+					// Got another JSON response — check compliance
+					retryBody, _ := io.ReadAll(retryResp.Body)
+					retryResp.Body.Close()
+
+					if detectComplianceBlock(retryBody) {
+						log.Printf("[COMPLIANCE] JSON retry %d/%d still compliance-blocked", retry+1, maxJSONRetries)
+						if s.rotator != nil && s.rotator.Len() > 0 {
+							deadAddr := s.rotator.RemoveCurrent()
+							if deadAddr != "" {
+								s.blacklistAddr(deadAddr)
+							}
+						}
+						continue
+					}
+
+					// Got clean JSON response — forward it
+					log.Printf("[COMPLIANCE] JSON retry %d/%d succeeded with clean JSON", retry+1, maxJSONRetries)
+					for key, values := range retryResp.Header {
+						for _, v := range values {
+							w.Header().Add(key, v)
+						}
+					}
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+					w.WriteHeader(retryResp.StatusCode)
+					w.Write(retryBody)
+					return
+				}
+
+				// All retries exhausted — forward original error
+				log.Printf("[COMPLIANCE] all JSON retries exhausted")
+			}
+
+			// Forward original JSON error as-is to client
+			forwardHeaders(w, resp)
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(fullBody)
+			return
+		}
+
+		// SSE stream — forward as event stream
+		forwardHeaders(w, resp)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(resp.StatusCode)
-
-		// Flush headers before streaming
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
-
+		// Write buffered lines
+		w.Write(complianceBuf)
+		// Continue streaming from the same scanner (reuse to avoid data loss)
 		proxyInfo := s.currentProxyInfo()
-		if err := streamSSE(resp, w, ThinkingTimeout, proxyInfo); err != nil {
+		if err := streamSSEFromScanner(scanner, w, ThinkingTimeout, proxyInfo, linesRead); err != nil {
 			log.Printf("[WARN] stream error: %v", err)
+			s.markProxyDead(err)
 		}
 	} else {
-		w.WriteHeader(resp.StatusCode)
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("[WARN] failed to read upstream response: %v", err)
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			log.Printf("[WARN] failed to read upstream response: %v", readErr)
+			w.WriteHeader(resp.StatusCode)
 			return
 		}
+
+		// Check for compliance block in non-streaming response
+		// Detect regardless of status code — upstream may return 200/403/441 with compliance text
+		if detectComplianceBlock(respBody) {
+			// Log for debugging (first 500 chars)
+			debugBody := respBody
+			if len(debugBody) > 500 {
+				debugBody = debugBody[:500]
+			}
+			log.Printf("[COMPLIANCE] compliance block detected in non-streaming response")
+
+			// Blacklist current proxy (atomic remove — advances rotator to next)
+			if s.rotator != nil && s.rotator.Len() > 0 {
+				deadAddr := s.rotator.RemoveCurrent()
+				if deadAddr != "" {
+					s.blacklistAddr(deadAddr)
+				}
+			}
+
+			const maxComplianceRetries = 5
+			for retry := 0; retry < maxComplianceRetries; retry++ {
+				if s.rotator != nil && s.rotator.Len() == 0 {
+					break
+				}
+
+				// Log current proxy
+				if s.rotator != nil {
+					idx := s.rotator.Index()
+					addr := s.rotator.Current()
+					log.Printf("[COMPLIANCE] retry %d/%d: using proxy[%d] %s", retry+1, maxComplianceRetries, idx, addr)
+				}
+
+				// Refresh JWT AFTER rotation — fetch through current (new) proxy
+				s.jwtMgr.Invalidate()
+				newJwt, jwtErr := s.jwtMgr.Get()
+				if jwtErr != nil {
+					log.Printf("[COMPLIANCE] JWT refresh failed on retry %d/%d: %v, marking dead + rotating", retry+1, maxComplianceRetries, jwtErr)
+					// This proxy is bad — mark dead + rotate to next
+					if s.rotator != nil && s.rotator.Len() > 0 {
+						deadAddr := s.rotator.RemoveCurrent()
+						if deadAddr != "" {
+							s.markAddrDead(deadAddr)
+						}
+					}
+					continue
+				}
+				upstreamHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", newJwt))
+
+				// Backoff between retries
+				if retry > 0 {
+					time.Sleep(1 * time.Second)
+				}
+
+				if resp != nil && resp.Body != nil {
+					resp.Body.Close()
+				}
+				resp, err = s.forwardRequest(chatURL, modifiedBody, upstreamHeaders, isStream)
+				if err != nil {
+					log.Printf("[COMPLIANCE] retry %d/%d failed: %v", retry+1, maxComplianceRetries, err)
+					resp = nil
+					continue
+				}
+
+				retryBody, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr != nil {
+					log.Printf("[COMPLIANCE] retry %d/%d read error: %v", retry+1, maxComplianceRetries, readErr)
+					continue
+				}
+
+				if detectComplianceBlock(retryBody) {
+					debugRetry := retryBody
+					if len(debugRetry) > 500 {
+						debugRetry = debugRetry[:500]
+					}
+					log.Printf("[COMPLIANCE] retry %d/%d still compliance-blocked", retry+1, maxComplianceRetries)
+					// Blacklist this proxy too (atomic) — advances rotator to next
+					if s.rotator != nil && s.rotator.Len() > 0 {
+						deadAddr := s.rotator.RemoveCurrent()
+						if deadAddr != "" {
+							s.blacklistAddr(deadAddr)
+						}
+					}
+					// JWT will be refreshed at the top of next loop iteration
+					continue
+				}
+
+				// Success — forward clean response
+				log.Printf("[COMPLIANCE] retry %d/%d succeeded (status %d)", retry+1, maxComplianceRetries, resp.StatusCode)
+				w.WriteHeader(resp.StatusCode)
+				w.Write(retryBody)
+				return
+			}
+
+			// All retries failed
+			http.Error(w, `{"error":"compliance block after proxy rotation"}`, http.StatusForbidden)
+			return
+		}
+
+		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
 	}
 }
@@ -753,8 +1185,126 @@ func (s *Server) createSSDialer(upstreamAddr string) *sspool.SSDialer {
 
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Save blacklist before shutdown
+	if s.blacklistMgr != nil {
+		if err := s.blacklistMgr.Save(); err != nil {
+			log.Printf("[Blacklist] save on shutdown failed: %v", err)
+		}
+		s.blacklistMgr.Stop()
+	}
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
 	}
 	return nil
+}
+
+// forwardHeaders copies response headers from upstream to client,
+// skipping Content-Length (we may write different size) and
+// Content-Encoding (body is already decompressed).
+func forwardHeaders(w http.ResponseWriter, resp *http.Response) {
+	for key, values := range resp.Header {
+		if key == "Content-Length" || key == "Content-Encoding" {
+			continue
+		}
+		for _, v := range values {
+			w.Header().Add(key, v)
+		}
+	}
+}
+
+// blacklistAddr adds an address to both the persistent blacklist and the pool's dead list.
+// ONLY use when compliance block pattern is detected in response.
+func (s *Server) blacklistAddr(addr string) {
+	if addr == "" {
+		return
+	}
+	if s.blacklistMgr != nil {
+		s.blacklistMgr.Add(addr)
+	}
+	if s.pool != nil {
+		s.pool.MarkDead(addr)
+	}
+}
+
+// markAddrDead marks an address as dead in the pool (temporary, not blacklist).
+// Use for transient errors like JWT failure, write errors, etc.
+func (s *Server) markAddrDead(addr string) {
+	if addr == "" {
+		return
+	}
+	if s.smartRouter != nil {
+		s.smartRouter.MarkDead(addr)
+	}
+	if s.pool != nil {
+		s.pool.MarkDead(addr)
+	}
+}
+
+// isBlacklisted checks if an address has a blacklisted IP.
+func (s *Server) isBlacklisted(addr string) bool {
+	if s.blacklistMgr == nil {
+		return false
+	}
+	return s.blacklistMgr.IsBlacklisted(addr)
+}
+
+// markProxyDead marks the current proxy as dead (temporary, not blacklist)
+// when a stream write error occurs. The proxy may recover later.
+func (s *Server) markProxyDead(err error) {
+	if !isStreamWriteError(err) {
+		return
+	}
+	if s.rotator == nil || s.rotator.Len() == 0 {
+		return
+	}
+	addr := s.rotator.Current()
+	if addr == "" {
+		return
+	}
+	log.Printf("[COMPLIANCE] marking proxy dead due to write error: %s", addr)
+	if s.smartRouter != nil {
+		s.smartRouter.MarkDead(addr)
+	}
+	if s.pool != nil {
+		s.pool.MarkDead(addr)
+	}
+}
+
+// isStreamWriteError checks if an error is a client-side write failure (broken pipe, etc).
+func isStreamWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "write:") ||
+		strings.Contains(msg, "connection reset")
+}
+
+// isValidSSEBuffer checks if a buffer contains valid SSE format.
+// At least one non-empty, non-comment line must start with "data:", "event:", or "id:".
+func isValidSSEBuffer(buf []byte) bool {
+	lines := bytes.Split(buf, []byte("\n"))
+	for _, line := range lines {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		// SSE comment line (starts with ":")
+		if trimmed[0] == ':' {
+			continue
+		}
+		// Valid SSE field: data:, event:, id:, retry:
+		if bytes.HasPrefix(trimmed, []byte("data:")) ||
+			bytes.HasPrefix(trimmed, []byte("event:")) ||
+			bytes.HasPrefix(trimmed, []byte("id:")) ||
+			bytes.HasPrefix(trimmed, []byte("retry:")) {
+			return true
+		}
+		// JSON object — not SSE
+		if trimmed[0] == '{' || trimmed[0] == '[' {
+			return false
+		}
+	}
+	return false
 }

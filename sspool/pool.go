@@ -8,12 +8,18 @@ import (
 	"time"
 )
 
+// BlacklistFilter checks if an address should be blocked.
+type BlacklistFilter interface {
+	IsBlacklisted(addr string) bool
+}
+
 // SSPool is a concurrent-safe pool of Shadowsocks servers with round-robin rotation.
 type SSPool struct {
 	mu        sync.RWMutex
 	servers   []SSConfig
 	index     int
 	deadAddrs map[string]time.Time
+	filter    BlacklistFilter // optional: skip blacklisted IPs on Add
 }
 
 // NewSSPool creates an empty SSPool.
@@ -23,10 +29,24 @@ func NewSSPool() *SSPool {
 	}
 }
 
+// SetFilter sets a blacklist filter. Proxies matching the filter are skipped on Add.
+func (p *SSPool) SetFilter(f BlacklistFilter) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.filter = f
+}
+
 // Add adds a server to the pool. Duplicates (same Key) are ignored.
 func (p *SSPool) Add(s SSConfig) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Skip if blacklisted (check IP:port against filter)
+	if p.filter != nil {
+		addr := fmt.Sprintf("%s:%d", s.Server, s.Port)
+		if p.filter.IsBlacklisted(addr) {
+			return
+		}
+	}
 	for _, existing := range p.servers {
 		if existing.Key() == s.Key() {
 			return

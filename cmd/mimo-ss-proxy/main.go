@@ -60,6 +60,8 @@ func main() {
 	}
 
 	pool := sspool.NewSSPool()
+	blacklistMgr := proxy.NewBlacklistManager(".")
+	pool.SetFilter(blacklistMgr)
 	var smartRouter *proxy.SmartRouter
 	var smartProxyInfos []*proxy.ProxyInfo
 	var fallbackHandler *proxy.FallbackHandler
@@ -82,6 +84,7 @@ func main() {
 			smartProxyInfos = loadMixedProxies(*proxyURL, *proxyFile, pool)
 			if len(smartProxyInfos) > 0 {
 				smartRouter = proxy.NewSmartRouter(smartProxyInfos)
+				smartRouter.SetFilter(blacklistMgr)
 				log.Printf("[SmartRouter] loaded %d mixed-protocol proxies", len(smartProxyInfos))
 			}
 		}
@@ -90,6 +93,7 @@ func main() {
 		smartProxyInfos = loadMixedProxies(*proxyURL, *proxyFile, pool)
 		if len(smartProxyInfos) > 0 {
 			smartRouter = proxy.NewSmartRouter(smartProxyInfos)
+			smartRouter.SetFilter(blacklistMgr)
 			log.Printf("[SmartRouter] loaded %d mixed-protocol proxies", len(smartProxyInfos))
 		}
 	}
@@ -118,6 +122,7 @@ func main() {
 	// Build FallbackHandler for fallback-proxy mode
 	if *mode == "fallback-proxy" {
 		fallbackHandler = proxy.NewFallbackHandler(smartRouter, 300*time.Second)
+		fallbackHandler.SetFilter(blacklistMgr)
 		log.Printf("[FallbackHandler] created for fallback-proxy mode")
 	}
 
@@ -126,6 +131,7 @@ func main() {
 		DisableRateLimit: *disableRateLimit,
 		SmartRouter:      smartRouter,
 		FallbackHandler:  fallbackHandler,
+		BlacklistMgr:     blacklistMgr,
 	}
 	// mode=auto: disable local rate limiter entirely (rely on upstream 429 + rotation)
 	// other modes: disable 2s min-interval only

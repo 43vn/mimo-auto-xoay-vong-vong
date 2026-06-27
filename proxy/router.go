@@ -23,7 +23,8 @@ type SmartRouter struct {
 	mu            sync.RWMutex
 	proxies       []*ProxyInfo
 	currentIndex  int
-	directDialer  sspool.ProxyDialer  // fallback: direct connection
+	directDialer  sspool.ProxyDialer // fallback: direct connection
+	filter        sspool.BlacklistFilter
 }
 
 // NewSmartRouter creates router with proxy list
@@ -31,6 +32,13 @@ func NewSmartRouter(proxies []*ProxyInfo) *SmartRouter {
 	return &SmartRouter{
 		proxies: proxies,
 	}
+}
+
+// SetFilter sets a blacklist filter. Blacklisted proxies are skipped in selection.
+func (r *SmartRouter) SetFilter(f sspool.BlacklistFilter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.filter = f
 }
 
 // SelectBest returns lowest-latency alive proxy; nil = use direct
@@ -41,6 +49,9 @@ func (r *SmartRouter) SelectBest() *ProxyInfo {
 	var best *ProxyInfo
 	for _, p := range r.proxies {
 		if !p.Alive {
+			continue
+		}
+		if r.filter != nil && r.filter.IsBlacklisted(p.Address) {
 			continue
 		}
 		if best == nil || p.Latency < best.Latency {
@@ -58,14 +69,18 @@ func (r *SmartRouter) SelectNext() *ProxyInfo {
 	if len(r.proxies) == 0 {
 		return nil
 	}
-	// Find next alive proxy
+	// Find next alive, non-blacklisted proxy
 	start := r.currentIndex
 	for {
 		p := r.proxies[r.currentIndex]
 		r.currentIndex = (r.currentIndex + 1) % len(r.proxies)
-		if p.Alive {
-			return p
+		if !p.Alive {
+			continue
 		}
+		if r.filter != nil && r.filter.IsBlacklisted(p.Address) {
+			continue
+		}
+		return p
 		if r.currentIndex == start {
 			// Full circle, no alive proxies
 			return nil
