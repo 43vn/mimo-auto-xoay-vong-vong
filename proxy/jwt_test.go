@@ -269,8 +269,8 @@ func TestBootstrapRequestUserAgent(t *testing.T) {
 	if userAgent == "" {
 		t.Error("User-Agent header is empty in bootstrap request")
 	}
-	if !strings.Contains(userAgent, "mimocode/0.1.1") {
-		t.Errorf("User-Agent = %q, want to contain %q", userAgent, "mimocode/0.1.1")
+	if !strings.Contains(userAgent, "mimocode/0.1.3") {
+		t.Errorf("User-Agent = %q, want to contain %q", userAgent, "mimocode/0.1.3")
 	}
 }
 

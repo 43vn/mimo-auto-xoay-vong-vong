@@ -10,6 +10,9 @@ import (
 // ErrComplianceBlock is returned when a stream contains a compliance block.
 var ErrComplianceBlock = fmt.Errorf("compliance block detected in stream")
 
+// ErrAuthError is returned when a stream contains an auth error (Invalid Token).
+var ErrAuthError = fmt.Errorf("auth error detected in stream")
+
 // compliancePatterns are the key phrases to detect in responses and prompts.
 var compliancePatterns = []string{
 	"high-frequency non-compliant",
@@ -27,6 +30,28 @@ func detectComplianceBlock(body []byte) bool {
 	lowerStr := strings.ToLower(string(body))
 	for _, p := range compliancePatterns {
 		if strings.Contains(lowerStr, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
+}
+
+// authErrorPatterns are the key phrases to detect auth errors in SSE responses.
+var authErrorPatterns = []string{
+	"invalid token",
+	"invalid_token",
+	"unauthorized",
+}
+
+// detectAuthError checks if the body contains an auth error (Invalid Token, 401).
+// Returns true if this is an auth error that should trigger JWT refresh + retry.
+func detectAuthError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	lowerStr := strings.ToLower(string(body))
+	for _, p := range authErrorPatterns {
+		if strings.Contains(lowerStr, p) {
 			return true
 		}
 	}

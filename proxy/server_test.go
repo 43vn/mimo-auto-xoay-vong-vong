@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -324,17 +323,12 @@ func TestServerStartAndShutdown(t *testing.T) {
 	}
 }
 
-// TestGenerateFingerprintLength32 verifies fingerprint = 32 bytes = 64 hex chars.
+// TestGenerateFingerprintLength verifies fingerprint = 26 alphanumeric chars.
 func TestGenerateFingerprintLength32(t *testing.T) {
 	fp := generateFingerprint()
-	// 32 bytes = 64 hex chars
-	expectedLen := 64
+	expectedLen := 26
 	if len(fp) != expectedLen {
-		t.Errorf("fingerprint length = %d, want %d (32 bytes = 64 hex chars)", len(fp), expectedLen)
-	}
-	// Also verify it's valid hex
-	if _, err := hex.DecodeString(fp); err != nil {
-		t.Errorf("fingerprint is not valid hex: %v", err)
+		t.Errorf("fingerprint length = %d, want %d", len(fp), expectedLen)
 	}
 }
 
@@ -378,7 +372,7 @@ func TestUpstreamUserAgent(t *testing.T) {
 	if userAgent == "" {
 		t.Fatal("User-Agent header is empty in upstream request")
 	}
-	expectedPrefix := "mimocode/0.1.1"
+	expectedPrefix := "mimocode/0.1.3"
 	if !strings.HasPrefix(userAgent, expectedPrefix) {
 		t.Errorf("User-Agent = %q, want prefix %q", userAgent, expectedPrefix)
 	}

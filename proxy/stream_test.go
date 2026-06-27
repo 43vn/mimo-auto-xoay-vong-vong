@@ -18,96 +18,117 @@ func mockSSEResponse(body string) *http.Response {
 	}
 }
 
-// TestStreamSSE_ReasoningContentSkip verifies that reasoning_content field is skipped
-func TestStreamSSE_ReasoningContentSkip(t *testing.T) {
-	// SSE line with reasoning_content field
-	body := "data: {\"reasoning_content\": \"some reasoning text\"}\n\n"
+// TestStreamSSEWithPreCheck_Clean verifies pre-check passes for clean SSE
+func TestStreamSSEWithPreCheck_Clean(t *testing.T) {
+	body := "data: {\"content\": \"hello world\"}\n\ndata: [DONE]\n\n"
 	resp := mockSSEResponse(body)
-	w := httptest.NewRecorder()
 
-	// Use a short thinking timeout that will expire before content detection
-	err := streamSSE(resp, w, 10*time.Millisecond, "test")
+	result, err := streamSSEWithPreCheck(resp, 5)
 	if err != nil {
-		t.Fatalf("streamSSE returned error: %v", err)
+		t.Fatalf("pre-check error: %v", err)
+	}
+	if !result.Clean {
+		t.Fatal("expected clean pre-check")
 	}
 
-	// The output should contain the original line
-	output := w.Body.String()
-	if !strings.Contains(output, "reasoning_content") {
-		t.Errorf("expected output to contain reasoning_content, got: %s", output)
-	}
-
-	// Verify that hasContent stayed false by checking that [DONE] was sent
-	// (thinking timeout triggered because no content was detected)
-	if !strings.Contains(output, "[DONE]") {
-		t.Errorf("expected [DONE] in output due to thinking timeout, got: %s", output)
-	}
-}
-
-// TestStreamSSE_ContentDetected verifies that actual content sets hasContent=true
-func TestStreamSSE_ContentDetected(t *testing.T) {
-	// SSE line with content field
-	body := "data: {\"content\": \"hello world\"}\n\n"
-	resp := mockSSEResponse(body)
+	// Stream the rest
 	w := httptest.NewRecorder()
-
-	// Use a long thinking timeout - should not trigger because content is detected
-	err := streamSSE(resp, w, 5*time.Second, "test")
+	err = streamSSEFromScanner(result.Scanner, w, 5*time.Second, "test", 0)
 	if err != nil {
-		t.Fatalf("streamSSE returned error: %v", err)
+		t.Fatalf("stream error: %v", err)
 	}
 
-	// The output should contain the original line
 	output := w.Body.String()
-	if !strings.Contains(output, "content") {
-		t.Errorf("expected output to contain content, got: %s", output)
+	if !strings.Contains(output, "hello world") {
+		t.Errorf("expected 'hello world' in output, got: %s", output)
 	}
-
-	// Verify that [DONE] was sent at the end of stream
 	if !strings.Contains(output, "[DONE]") {
 		t.Errorf("expected [DONE] in output, got: %s", output)
 	}
 }
 
-// TestStreamSSE_EmptyContent verifies that null/empty content does NOT set hasContent
-func TestStreamSSE_EmptyContent(t *testing.T) {
-	// Test cases: null content and empty string content
-	testCases := []struct {
-		name string
-		body string
-	}{
-		{
-			name: "null content",
-			body: "data: {\"content\": null}\n\n",
-		},
-		{
-			name: "empty string content",
-			body: "data: {\"content\": \"\"}\n\n",
-		},
+// TestStreamSSEWithPreCheck_ComplianceBlock verifies pre-check catches compliance block
+func TestStreamSSEWithPreCheck_ComplianceBlock(t *testing.T) {
+	body := "data: {\"error\":{\"code\":\"441\",\"message\":\"Detected high-frequency non-compliant requests\"}}\n\ndata: [DONE]\n\n"
+	resp := mockSSEResponse(body)
+
+	result, err := streamSSEWithPreCheck(resp, 5)
+	if err != nil {
+		t.Fatalf("pre-check error: %v", err)
+	}
+	if result.Clean {
+		t.Fatal("expected compliance block to be detected")
+	}
+}
+
+// TestStreamSSEFromScanner_MidStreamComplianceBlock verifies mid-stream compliance sends [DONE]
+func TestStreamSSEFromScanner_MidStreamComplianceBlock(t *testing.T) {
+	// First 5 lines clean, then compliance block on line 6
+	body := "data: {\"content\": \"a\"}\n\ndata: {\"content\": \"b\"}\n\ndata: {\"content\": \"c\"}\n\ndata: {\"content\": \"d\"}\n\ndata: {\"content\": \"e\"}\n\ndata: {\"error\":{\"message\":\"Detected high-frequency non-compliant requests\"}}\n\ndata: [DONE]\n\n"
+	resp := mockSSEResponse(body)
+
+	// Pre-check passes (first 5 lines clean)
+	result, err := streamSSEWithPreCheck(resp, 5)
+	if err != nil {
+		t.Fatalf("pre-check error: %v", err)
+	}
+	if !result.Clean {
+		t.Fatal("expected clean pre-check")
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			resp := mockSSEResponse(tc.body)
-			w := httptest.NewRecorder()
+	// Stream — should detect compliance block mid-stream
+	w := httptest.NewRecorder()
+	err = streamSSEFromScanner(result.Scanner, w, 5*time.Second, "test", 0)
+	if err != ErrComplianceBlock {
+		t.Fatalf("expected ErrComplianceBlock, got: %v", err)
+	}
 
-			// Use a short thinking timeout - should trigger because content is empty/null
-			err := streamSSE(resp, w, 10*time.Millisecond, "test")
-			if err != nil {
-				t.Fatalf("streamSSE returned error: %v", err)
-			}
+	output := w.Body.String()
+	// Should contain [DONE] (clean end for client)
+	if !strings.Contains(output, "[DONE]") {
+		t.Errorf("expected [DONE] in output, got: %s", output)
+	}
+	// Should NOT contain compliance text (not forwarded to client)
+	if strings.Contains(output, "high-frequency") {
+		t.Errorf("compliance text should NOT be forwarded to client, got: %s", output)
+	}
+}
 
-			// The output should contain the original line
-			output := w.Body.String()
-			if !strings.Contains(output, "content") {
-				t.Errorf("expected output to contain content, got: %s", output)
-			}
+// TestStreamSSEWithPreCheck_ShortStream verifies pre-check works with < 5 lines
+func TestStreamSSEWithPreCheck_ShortStream(t *testing.T) {
+	body := "data: {\"content\": \"short\"}\n\ndata: [DONE]\n\n"
+	resp := mockSSEResponse(body)
 
-			// Verify that [DONE] was sent due to thinking timeout
-			// (hasContent stayed false because content was null/empty)
-			if !strings.Contains(output, "[DONE]") {
-				t.Errorf("expected [DONE] in output due to thinking timeout, got: %s", output)
-			}
-		})
+	result, err := streamSSEWithPreCheck(resp, 5)
+	if err != nil {
+		t.Fatalf("pre-check error: %v", err)
+	}
+	if !result.Clean {
+		t.Fatal("expected clean pre-check")
+	}
+
+	// Stream remaining — should get [DONE]
+	w := httptest.NewRecorder()
+	err = streamSSEFromScanner(result.Scanner, w, 5*time.Second, "test", 0)
+	if err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+	output := w.Body.String()
+	if !strings.Contains(output, "[DONE]") {
+		t.Errorf("expected [DONE] in output, got: %s", output)
+	}
+}
+
+// TestStreamSSEWithPreCheck_ShortStreamComplianceBlock verifies short stream with compliance block
+func TestStreamSSEWithPreCheck_ShortStreamComplianceBlock(t *testing.T) {
+	body := "data: {\"error\":{\"message\":\"Detected high-frequency non-compliant\"}}\n\n"
+	resp := mockSSEResponse(body)
+
+	result, err := streamSSEWithPreCheck(resp, 5)
+	if err != nil {
+		t.Fatalf("pre-check error: %v", err)
+	}
+	if result.Clean {
+		t.Fatal("expected compliance block to be detected in short stream")
 	}
 }

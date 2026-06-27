@@ -97,7 +97,7 @@ func (m *JWTManager) fetch() (string, error) {
 			return "", fmt.Errorf("create bootstrap request: %w", reqErr)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "mimocode/0.1.1")
+		req.Header.Set("User-Agent", "mimocode/0.1.3")
 		req.Header.Set("Accept", "*/*")
 		resp, err = m.httpClient.Do(req)
 	}
